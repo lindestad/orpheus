@@ -2,14 +2,14 @@
 
 A small Windows-focused mouse polling-rate monitor and switcher.
 
-The current app is a Rust CLI/TUI. It reads the mouse's configured polling rate through HID feature/input reports, can set a target rate, and can watch running processes to apply simple app-specific rate rules.
+The current app is a Rust CLI/TUI. It reads the mouse's configured polling rate through HID feature/input reports, reads battery telemetry where the vendor protocol exposes it, can set a target rate, and can watch running processes to apply app-specific rate rules.
 
 ## Status
 
 This is an early working prototype. It has been tested against:
 
-- G-Wolves Fenrir receiver `33e4:3517`, including read and no-op write.
-- IPI Piao wireless receiver `372e:1014`, including read and no-op write.
+- G-Wolves Fenrir receiver `33e4:3517`, including rate read/write and battery level/status.
+- IPI Piao wireless receiver `372e:1014`, including rate read/write and battery level.
 
 Supported model IDs currently cover known Fenrir, Fenrir Pro, and Fenir Max wired/receiver IDs from G-Wolves WebHID protocol data, plus IPI Piao/Float-style PIX v1 mouse IDs from `https://shan.ipigame.cn/devices`.
 
@@ -21,7 +21,7 @@ Launch the TUI:
 cargo run
 ```
 
-List supported devices and current configured polling rates:
+List supported devices, current configured polling rates, and battery telemetry:
 
 ```powershell
 cargo run -- list
@@ -78,14 +78,34 @@ rate = 1000
 restore = 8000
 ```
 
+For a two-mouse setup where the idle mouse is charging and the active mouse should be boosted while a target process runs:
+
+```toml
+default_rate = 1000
+restore_rate = 1000
+scan_interval_ms = 1000
+power_policy = "active-non-charging"
+assume_wired_is_charging = true
+assume_wireless_is_discharging = true
+allow_unknown_power_active = true
+
+[[rules]]
+exe = "problem-game.exe"
+rate = 4000
+restore = 1000
+```
+
 Rules are checked in file order. The first matching process wins. Process names are matched case-insensitively with an optional `.exe` suffix.
 
 Rates can be written as numbers (`1000`, `8000`) or shorthand strings (`"1k"`, `"8k"`).
+
+`power_policy = "first-device"` keeps the original behavior: the watcher only changes the first supported device when the active rule changes. `power_policy = "active-non-charging"` scans supported devices every watcher tick. While a rule is active it applies the rule rate to non-charging devices and keeps charging devices at the idle rate. Devices with unknown power state are used as the active fallback only when no known non-charging device is visible.
 
 ## Design Notes
 
 - The TUI and watcher query the configured polling rate through device control reports, not by sampling pointer movement.
 - Device support is implemented as per-vendor protocol adapters under one HID monitor path.
 - The watcher scans processes at `scan_interval_ms`, with a minimum interval of 250 ms.
-- The watcher writes only when the desired rule target changes.
+- In first-device mode, the watcher writes only when the desired rule target changes.
+- In active-non-charging mode, the watcher polls device power state on each process scan and writes only when a device is not already at its target rate.
 - The long-term path is to keep this HID/control core and add a system tray UI around it later.

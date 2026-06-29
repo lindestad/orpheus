@@ -1,9 +1,13 @@
 # poll-monitor config
-default_rate = 8000
-restore_rate = 8000
+default_rate = 1000
+restore_rate = 1000
 scan_interval_ms = 1000
+power_policy = "active-non-charging"
+assume_wired_is_charging = true
+assume_wireless_is_discharging = true
+allow_unknown_power_active = true
 
 [[rules]]
 exe = "problem-game.exe"
-rate = 1000
-restore = 8000
+rate = 4000
+restore = 1000
