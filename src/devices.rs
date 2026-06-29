@@ -20,6 +20,85 @@ pub enum PollingRate {
     Hz8000,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChargeState {
+    Discharging,
+    Charging,
+    Full,
+    Unknown,
+    Raw(u8),
+}
+
+impl ChargeState {
+    pub const fn is_charging_like(self) -> Option<bool> {
+        match self {
+            Self::Charging | Self::Full => Some(true),
+            Self::Discharging => Some(false),
+            Self::Unknown | Self::Raw(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for ChargeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Discharging => write!(f, "discharging"),
+            Self::Charging => write!(f, "charging"),
+            Self::Full => write!(f, "full"),
+            Self::Unknown => write!(f, "unknown"),
+            Self::Raw(raw) => write!(f, "raw {raw}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatteryStatus {
+    pub level_percent: Option<u8>,
+    pub charge_state: ChargeState,
+    pub raw_state: Option<u8>,
+}
+
+impl BatteryStatus {
+    pub const fn level_only(level_percent: u8) -> Self {
+        Self {
+            level_percent: Some(level_percent),
+            charge_state: ChargeState::Unknown,
+            raw_state: None,
+        }
+    }
+
+    pub const fn with_raw_state(
+        level_percent: u8,
+        charge_state: ChargeState,
+        raw_state: u8,
+    ) -> Self {
+        Self {
+            level_percent: Some(level_percent),
+            charge_state,
+            raw_state: Some(raw_state),
+        }
+    }
+
+    pub const fn is_charging_like(self) -> Option<bool> {
+        self.charge_state.is_charging_like()
+    }
+}
+
+impl fmt::Display for BatteryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.level_percent, self.charge_state, self.raw_state) {
+            (Some(level), ChargeState::Unknown, None) => write!(f, "{level}%"),
+            (Some(level), ChargeState::Raw(raw), _) => write!(f, "{level}% raw {raw}"),
+            (Some(level), state, Some(raw)) => write!(f, "{level}% {state} (raw {raw})"),
+            (Some(level), state, None) => write!(f, "{level}% {state}"),
+            (None, ChargeState::Unknown, None) => write!(f, "unknown"),
+            (None, ChargeState::Raw(raw), _) => write!(f, "raw {raw}"),
+            (None, state, Some(raw)) => write!(f, "{state} (raw {raw})"),
+            (None, state, None) => write!(f, "{state}"),
+        }
+    }
+}
+
 impl PollingRate {
     pub const fn hz(self) -> u16 {
         match self {
@@ -106,6 +185,15 @@ impl PollingRate {
             6 => Some(Self::Hz2000),
             _ => None,
         }
+    }
+}
+
+pub const fn gwolves_charge_state_from_status(status: u8) -> ChargeState {
+    match status {
+        0 => ChargeState::Discharging,
+        1 => ChargeState::Charging,
+        2 => ChargeState::Full,
+        raw => ChargeState::Raw(raw),
     }
 }
 
@@ -559,6 +647,32 @@ pub fn build_feature64_set_rate(
     report
 }
 
+pub fn build_feature64_get_battery(protocol: ProtocolKind, connection: ConnectionKind) -> [u8; 64] {
+    let mut report = [0; 64];
+    match protocol {
+        ProtocolKind::Feature64 {
+            new_protocol: true,
+            wired_device_id,
+        } => {
+            report[2] = wired_device_id;
+            report[3] = 2;
+            report[5] = 131;
+        }
+        ProtocolKind::Feature64 {
+            new_protocol: false,
+            ..
+        } => {
+            report[1] = 2;
+            report[2] = 143;
+            if !connection.is_wired() {
+                report[3] = 1;
+            }
+        }
+        ProtocolKind::Eeprom16 | ProtocolKind::IpiPixV1 { .. } => {}
+    }
+    report
+}
+
 pub fn build_eeprom16_get_rate() -> [u8; 16] {
     let mut report = [0; 16];
     report[0] = 8;
@@ -585,6 +699,13 @@ pub fn build_eeprom16_set_rate(rate: PollingRate) -> [u8; 16] {
 pub fn build_ipi_pix_v1_get_rate() -> [u8; 63] {
     let mut report = [0; 63];
     report[0..6].copy_from_slice(&[0, 80, 0, 10, 79, 64]);
+    write_ipi_checksum(&mut report);
+    report
+}
+
+pub fn build_ipi_pix_v1_get_basic_info() -> [u8; 63] {
+    let mut report = [0; 63];
+    report[0..6].copy_from_slice(&[0, 80, 0, 2, 79, 129]);
     write_ipi_checksum(&mut report);
     report
 }
@@ -700,6 +821,27 @@ mod tests {
     }
 
     #[test]
+    fn builds_feature64_battery_reports() {
+        let new_report = build_feature64_get_battery(
+            ProtocolKind::Feature64 {
+                new_protocol: true,
+                wired_device_id: 2,
+            },
+            ConnectionKind::Receiver,
+        );
+        assert_eq!(&new_report[2..6], &[2, 2, 0, 131]);
+
+        let old_report = build_feature64_get_battery(
+            ProtocolKind::Feature64 {
+                new_protocol: false,
+                wired_device_id: 2,
+            },
+            ConnectionKind::Receiver,
+        );
+        assert_eq!(&old_report[1..4], &[2, 143, 1]);
+    }
+
+    #[test]
     fn old_feature64_models_also_probe_new_protocol() {
         let (model, _) = find_model(GWOLVES_VENDOR_ID, 0x3517).unwrap();
         assert_eq!(
@@ -733,6 +875,12 @@ mod tests {
 
         let set_wireless = build_ipi_pix_v1_set_rate(ConnectionKind::Wireless, PollingRate::Hz8000);
         assert_eq!(&set_wireless[0..7], &[188, 80, 1, 49, 53, 1, 4]);
+    }
+
+    #[test]
+    fn builds_ipi_pix_v1_basic_info_report() {
+        let report = build_ipi_pix_v1_get_basic_info();
+        assert_eq!(&report[0..6], &[34, 80, 0, 2, 79, 129]);
     }
 
     #[test]

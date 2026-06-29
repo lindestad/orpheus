@@ -4,10 +4,11 @@ use anyhow::{Context, Result, anyhow};
 use hidapi::{HidApi, HidDevice};
 
 use crate::devices::{
-    ConnectionKind, ModelInfo, PollingRate, ProtocolKind, build_eeprom16_get_rate,
-    build_eeprom16_set_rate, build_feature64_get_rate, build_feature64_set_rate,
-    build_ipi_pix_v1_get_rate, build_ipi_pix_v1_set_rate, find_model, format_supported_rates,
-    ipi_pix_v1_rate_from_sensor_byte,
+    BatteryStatus, ConnectionKind, ModelInfo, PollingRate, ProtocolKind, build_eeprom16_get_rate,
+    build_eeprom16_set_rate, build_feature64_get_battery, build_feature64_get_rate,
+    build_feature64_set_rate, build_ipi_pix_v1_get_basic_info, build_ipi_pix_v1_get_rate,
+    build_ipi_pix_v1_set_rate, find_model, format_supported_rates,
+    gwolves_charge_state_from_status, ipi_pix_v1_rate_from_sensor_byte,
 };
 
 const DEFAULT_PROFILE: u8 = 1;
@@ -30,12 +31,25 @@ pub struct DeviceSnapshot {
     pub protocol: ProtocolKind,
     pub supported_rates: Vec<PollingRate>,
     pub current_rate: Option<PollingRate>,
+    pub battery: Option<BatteryStatus>,
+    pub battery_error: Option<String>,
     pub read_error: Option<String>,
 }
 
 impl DeviceSnapshot {
     pub fn supported_rates_text(&self) -> String {
         format_supported_rates(&self.supported_rates)
+    }
+
+    pub fn battery_text(&self) -> String {
+        self.battery
+            .map(|battery| battery.to_string())
+            .or_else(|| {
+                self.battery_error
+                    .as_ref()
+                    .map(|_| "battery read error".to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string())
     }
 }
 
@@ -71,6 +85,8 @@ impl HidPollMonitor {
                 protocol: probe.protocol,
                 supported_rates: model.supported_rates(connection).to_vec(),
                 current_rate: probe.current_rate,
+                battery: probe.battery,
+                battery_error: probe.battery_error,
                 read_error: probe.read_error,
             };
 
@@ -153,9 +169,12 @@ impl HidPollMonitor {
             let live = PollingDevice::new(device, model, connection, protocol);
             match live.read_rate() {
                 Ok(rate) => {
+                    let battery = self.probe_battery(&live);
                     return DeviceProbe {
                         protocol,
                         current_rate: Some(rate),
+                        battery: battery.battery,
+                        battery_error: battery.error,
                         read_error: None,
                     };
                 }
@@ -166,7 +185,22 @@ impl HidPollMonitor {
         DeviceProbe {
             protocol: model.protocol,
             current_rate: None,
+            battery: None,
+            battery_error: None,
             read_error: Some(errors.join("; ")),
+        }
+    }
+
+    fn probe_battery(&self, live: &PollingDevice) -> BatteryProbe {
+        match live.read_battery() {
+            Ok(battery) => BatteryProbe {
+                battery: Some(battery),
+                error: None,
+            },
+            Err(err) => BatteryProbe {
+                battery: None,
+                error: Some(err.to_string()),
+            },
         }
     }
 }
@@ -174,7 +208,14 @@ impl HidPollMonitor {
 struct DeviceProbe {
     protocol: ProtocolKind,
     current_rate: Option<PollingRate>,
+    battery: Option<BatteryStatus>,
+    battery_error: Option<String>,
     read_error: Option<String>,
+}
+
+struct BatteryProbe {
+    battery: Option<BatteryStatus>,
+    error: Option<String>,
 }
 
 fn merge_snapshot(devices: &mut Vec<DeviceSnapshot>, snapshot: DeviceSnapshot) {
@@ -191,6 +232,12 @@ fn merge_snapshot(devices: &mut Vec<DeviceSnapshot>, snapshot: DeviceSnapshot) {
         *existing = snapshot;
     } else if existing.current_rate.is_none() && existing.read_error.is_none() {
         existing.read_error = snapshot.read_error;
+        existing.battery_error = snapshot.battery_error;
+    } else if existing.battery.is_none() && snapshot.battery.is_some() {
+        existing.battery = snapshot.battery;
+        existing.battery_error = None;
+    } else if existing.battery.is_none() && existing.battery_error.is_none() {
+        existing.battery_error = snapshot.battery_error;
     }
 }
 
@@ -236,6 +283,16 @@ impl PollingDevice {
         }
     }
 
+    pub fn read_battery(&self) -> Result<BatteryStatus> {
+        match self.protocol {
+            ProtocolKind::Feature64 { .. } => self.read_feature64_battery(),
+            ProtocolKind::IpiPixV1 { .. } => self.read_ipi_pix_v1_battery(),
+            ProtocolKind::Eeprom16 => Err(anyhow!(
+                "battery telemetry is not implemented for report8 eeprom protocol"
+            )),
+        }
+    }
+
     pub fn set_rate(&self, rate: PollingRate) -> Result<()> {
         self.model.require_rate(self.connection, rate)?;
         match self.protocol {
@@ -263,6 +320,29 @@ impl PollingDevice {
         thread::sleep(Duration::from_millis(20));
         let _ = self.get_feature_payload(FEATURE_REPORT_ID, FEATURE_PAYLOAD_LEN);
         Ok(())
+    }
+
+    fn read_feature64_battery(&self) -> Result<BatteryStatus> {
+        let report = build_feature64_get_battery(self.protocol, self.connection);
+        self.send_feature_payload(FEATURE_REPORT_ID, &report)?;
+        let delay = match self.protocol {
+            ProtocolKind::Feature64 {
+                new_protocol: true, ..
+            } => 100,
+            ProtocolKind::Feature64 {
+                new_protocol: false,
+                ..
+            } => 50,
+            ProtocolKind::Eeprom16 | ProtocolKind::IpiPixV1 { .. } => unreachable!(),
+        };
+        thread::sleep(Duration::from_millis(delay));
+        let response = self.get_feature_payload(FEATURE_REPORT_ID, FEATURE_PAYLOAD_LEN)?;
+        let (raw_state, level) = self.extract_feature64_battery(&response)?;
+        Ok(BatteryStatus::with_raw_state(
+            level,
+            gwolves_charge_state_from_status(raw_state),
+            raw_state,
+        ))
     }
 
     fn read_eeprom16_rate(&self) -> Result<PollingRate> {
@@ -306,6 +386,90 @@ impl PollingDevice {
         thread::sleep(Duration::from_millis(60));
         let _ = self.get_ipi_pix_v1_response(report_id, &report);
         Ok(())
+    }
+
+    fn read_ipi_pix_v1_battery(&self) -> Result<BatteryStatus> {
+        let ProtocolKind::IpiPixV1 { report_id } = self.protocol else {
+            unreachable!("ipi battery reader called for non-ipi protocol")
+        };
+        let report = build_ipi_pix_v1_get_basic_info();
+        self.send_feature_payload(report_id, &report)?;
+        thread::sleep(Duration::from_millis(100));
+        let response = self.get_ipi_pix_v1_response(report_id, &report)?;
+        let level = response
+            .get(5)
+            .copied()
+            .ok_or_else(|| anyhow!("short ipi pix v1 response while reading battery"))?;
+        Ok(BatteryStatus::level_only(level))
+    }
+
+    fn extract_feature64_battery(&self, response: &[u8]) -> Result<(u8, u8)> {
+        match self.protocol {
+            ProtocolKind::Feature64 {
+                new_protocol: true, ..
+            } => {
+                if response.get(1) == Some(&0xA1)
+                    && response.get(4) == Some(&2)
+                    && response.get(6) == Some(&131)
+                {
+                    let state = response.get(7).copied().ok_or_else(|| {
+                        anyhow!("short feature response while reading battery state")
+                    })?;
+                    let level = response.get(8).copied().ok_or_else(|| {
+                        anyhow!("short feature response while reading battery level")
+                    })?;
+                    return Ok((state, level));
+                }
+
+                if response.first() == Some(&0xA1)
+                    && response.get(3) == Some(&2)
+                    && response.get(5) == Some(&131)
+                {
+                    let state = response.get(6).copied().ok_or_else(|| {
+                        anyhow!("short feature response while reading battery state")
+                    })?;
+                    let level = response.get(7).copied().ok_or_else(|| {
+                        anyhow!("short feature response while reading battery level")
+                    })?;
+                    return Ok((state, level));
+                }
+            }
+            ProtocolKind::Feature64 {
+                new_protocol: false,
+                ..
+            } => {
+                if response.get(1) == Some(&0xA1)
+                    && response.get(2) == Some(&2)
+                    && response.get(3) == Some(&143)
+                {
+                    let state = response.get(5).copied().ok_or_else(|| {
+                        anyhow!("short feature response while reading battery state")
+                    })?;
+                    let level = response.get(6).copied().ok_or_else(|| {
+                        anyhow!("short feature response while reading battery level")
+                    })?;
+                    return Ok((state, level));
+                }
+
+                if response.first() == Some(&0xA1)
+                    && response.get(1) == Some(&2)
+                    && response.get(2) == Some(&143)
+                {
+                    let state = response.get(4).copied().ok_or_else(|| {
+                        anyhow!("short feature response while reading battery state")
+                    })?;
+                    let level = response.get(5).copied().ok_or_else(|| {
+                        anyhow!("short feature response while reading battery level")
+                    })?;
+                    return Ok((state, level));
+                }
+            }
+            ProtocolKind::Eeprom16 | ProtocolKind::IpiPixV1 { .. } => {
+                unreachable!("feature64 battery parser called for non-feature64 protocol")
+            }
+        }
+
+        Err(anyhow!("device returned an unrecognized battery response"))
     }
 
     fn extract_feature64_rate_code(&self, response: &[u8]) -> Result<u8> {

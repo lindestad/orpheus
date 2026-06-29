@@ -71,17 +71,21 @@ fn list_devices() -> Result<()> {
             .map(|rate| rate.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         println!(
-            "{:04x}:{:04x} {:<9} {:<18} {:<8} current: {:<8} supported: {}",
+            "{:04x}:{:04x} {:<9} {:<18} {:<8} current: {:<8} battery: {:<24} supported: {}",
             device.vid,
             device.pid,
             device.vendor_name,
             device.model_name,
             device.connection,
             current,
+            device.battery_text(),
             format_supported_rates(&device.supported_rates)
         );
         if let Some(error) = device.read_error {
             println!("  read error: {error}");
+        }
+        if let Some(error) = device.battery_error {
+            println!("  battery error: {error}");
         }
     }
     Ok(())

@@ -292,17 +292,19 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .current_rate
             .map(|rate| rate.hz().to_string())
             .unwrap_or_else(|| "-".to_string());
+        let battery = device.battery_text();
         let status = device
             .read_error
             .as_ref()
             .map(|_| "read error")
+            .or_else(|| device.battery_error.as_ref().map(|_| "battery"))
             .unwrap_or("ok");
         let style = if idx == app.selected_device {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
-        } else if device.read_error.is_some() {
+        } else if device.read_error.is_some() || device.battery_error.is_some() {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default()
@@ -315,6 +317,7 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Cell::from(device.connection.to_string()),
             Cell::from(device.protocol.to_string()),
             Cell::from(current),
+            Cell::from(battery),
             Cell::from(device.supported_rates_text()),
             Cell::from(status),
         ])
@@ -328,9 +331,10 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Constraint::Length(14),
             Constraint::Length(11),
             Constraint::Length(10),
-            Constraint::Length(15),
+            Constraint::Length(14),
             Constraint::Length(8),
-            Constraint::Min(24),
+            Constraint::Length(22),
+            Constraint::Min(18),
             Constraint::Length(12),
         ],
     )
@@ -342,6 +346,7 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             "Mode",
             "Protocol",
             "Current",
+            "Battery",
             "Supported",
             "Status",
         ])
@@ -373,6 +378,7 @@ fn draw_rate_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .target_rate
         .map(|rate| rate.to_string())
         .unwrap_or_else(|| "none".to_string());
+    let battery = device.battery_text();
 
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
@@ -391,6 +397,10 @@ fn draw_rate_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
+    lines.push(Line::from(vec![
+        Span::styled("battery ", Style::default().fg(Color::Gray)),
+        Span::styled(battery, Style::default().fg(Color::White)),
+    ]));
 
     lines.push(Line::raw(""));
     lines.push(rate_line(&device.supported_rates, app.target_rate));
@@ -399,6 +409,13 @@ fn draw_rate_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
             Span::styled("read error ", Style::default().fg(Color::Yellow)),
+            Span::raw(error),
+        ]));
+    }
+    if let Some(error) = &device.battery_error {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("battery error ", Style::default().fg(Color::Yellow)),
             Span::raw(error),
         ]));
     }
