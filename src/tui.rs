@@ -19,11 +19,12 @@ use ratatui::{
 };
 
 use crate::{
-    devices::PollingRate,
+    devices::{BatteryStatus, ChargeState, PollingRate},
     hid_device::{DeviceSnapshot, HidPollMonitor},
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
+const CHARGING_ICON: &str = "⚡";
 
 pub fn run_tui() -> Result<()> {
     enable_raw_mode().context("failed to enable raw terminal mode")?;
@@ -292,7 +293,7 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .current_rate
             .map(|rate| rate.hz().to_string())
             .unwrap_or_else(|| "-".to_string());
-        let battery = device.battery_text();
+        let power = power_summary(device);
         let status = device
             .read_error
             .as_ref()
@@ -317,7 +318,7 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Cell::from(device.connection.to_string()),
             Cell::from(device.protocol.to_string()),
             Cell::from(current),
-            Cell::from(battery),
+            Cell::from(power),
             Cell::from(device.supported_rates_text()),
             Cell::from(status),
         ])
@@ -330,11 +331,11 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Constraint::Length(13),
             Constraint::Length(14),
             Constraint::Length(11),
-            Constraint::Length(10),
+            Constraint::Length(9),
             Constraint::Length(14),
-            Constraint::Length(8),
-            Constraint::Length(22),
-            Constraint::Min(18),
+            Constraint::Length(7),
+            Constraint::Length(10),
+            Constraint::Min(24),
             Constraint::Length(12),
         ],
     )
@@ -345,8 +346,8 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             "VID:PID",
             "Mode",
             "Protocol",
-            "Current",
-            "Battery",
+            "Rate",
+            "Charge",
             "Supported",
             "Status",
         ])
@@ -378,7 +379,7 @@ fn draw_rate_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .target_rate
         .map(|rate| rate.to_string())
         .unwrap_or_else(|| "none".to_string());
-    let battery = device.battery_text();
+    let power = power_detail(device);
 
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
@@ -398,8 +399,8 @@ fn draw_rate_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("battery ", Style::default().fg(Color::Gray)),
-        Span::styled(battery, Style::default().fg(Color::White)),
+        Span::styled("charge ", Style::default().fg(Color::Gray)),
+        Span::styled(power, Style::default().fg(Color::White)),
     ]));
 
     lines.push(Line::raw(""));
@@ -426,6 +427,61 @@ fn draw_rate_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .block(Block::default().title("Rate").borders(Borders::ALL)),
         area,
     );
+}
+
+fn power_summary(device: &DeviceSnapshot) -> String {
+    let Some(battery) = device.battery else {
+        return if device.battery_error.is_some() {
+            "error".to_string()
+        } else {
+            "-".to_string()
+        };
+    };
+
+    let mut text = battery_level_text(battery);
+    match battery.charge_state {
+        ChargeState::Charging => {
+            text.push(' ');
+            text.push_str(CHARGING_ICON);
+        }
+        ChargeState::Full => text.push_str(" full"),
+        ChargeState::Discharging | ChargeState::Unknown => {}
+        ChargeState::Raw(raw) => {
+            if battery.level_percent.is_none() {
+                text = format!("raw {raw}");
+            }
+        }
+    }
+    text
+}
+
+fn power_detail(device: &DeviceSnapshot) -> String {
+    let Some(battery) = device.battery else {
+        return device.battery_text();
+    };
+
+    match battery.charge_state {
+        ChargeState::Charging => {
+            format!("{} {CHARGING_ICON} charging", battery_level_text(battery))
+        }
+        ChargeState::Full => format!("{} full", battery_level_text(battery)),
+        ChargeState::Discharging => format!("{} discharging", battery_level_text(battery)),
+        ChargeState::Unknown => {
+            if battery.level_percent.is_some() {
+                format!("{} (state unknown)", battery_level_text(battery))
+            } else {
+                "state unknown".to_string()
+            }
+        }
+        ChargeState::Raw(raw) => format!("{} raw state {raw}", battery_level_text(battery)),
+    }
+}
+
+fn battery_level_text(battery: BatteryStatus) -> String {
+    battery
+        .level_percent
+        .map(|level| format!("{level}%"))
+        .unwrap_or_else(|| "level unknown".to_string())
 }
 
 fn rate_line(rates: &[PollingRate], selected: Option<PollingRate>) -> Line<'static> {
@@ -484,4 +540,47 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .block(Block::default().borders(Borders::ALL)),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::{BatteryStatus, ConnectionKind, ProtocolKind};
+
+    #[test]
+    fn compact_power_summary_marks_charging_only() {
+        let mut device = test_device(Some(BatteryStatus::with_raw_state(
+            75,
+            ChargeState::Discharging,
+            0,
+        )));
+        assert_eq!(power_summary(&device), "75%");
+
+        device.battery = Some(BatteryStatus::with_raw_state(80, ChargeState::Charging, 1));
+        assert_eq!(power_summary(&device), "80% ⚡");
+    }
+
+    #[test]
+    fn power_detail_keeps_state_text() {
+        let device = test_device(Some(BatteryStatus::level_only(100)));
+        assert_eq!(power_detail(&device), "100% (state unknown)");
+    }
+
+    fn test_device(battery: Option<BatteryStatus>) -> DeviceSnapshot {
+        DeviceSnapshot {
+            path: "test".to_string(),
+            vid: 0x1234,
+            pid: 0x5678,
+            product_name: None,
+            vendor_name: "Test",
+            model_name: "Mouse",
+            connection: ConnectionKind::Wireless,
+            protocol: ProtocolKind::IpiPixV1 { report_id: 3 },
+            supported_rates: vec![PollingRate::Hz1000],
+            current_rate: Some(PollingRate::Hz1000),
+            battery,
+            battery_error: None,
+            read_error: None,
+        }
+    }
 }
