@@ -1,4 +1,8 @@
-use std::{thread, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use hidapi::{HidApi, HidDevice};
@@ -32,6 +36,8 @@ pub struct DeviceSnapshot {
     pub supported_rates: Vec<PollingRate>,
     pub current_rate: Option<PollingRate>,
     pub battery: Option<BatteryStatus>,
+    pub cached_rate: bool,
+    pub cached_battery: bool,
     pub battery_error: Option<String>,
     pub read_error: Option<String>,
 }
@@ -42,15 +48,83 @@ impl DeviceSnapshot {
     }
 
     pub fn battery_text(&self) -> String {
-        self.battery
+        let mut text = self
+            .battery
             .map(|battery| battery.to_string())
             .or_else(|| {
                 self.battery_error
                     .as_ref()
                     .map(|_| "battery read error".to_string())
             })
-            .unwrap_or_else(|| "unknown".to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        if self.cached_battery && self.battery.is_some() {
+            text.push_str(" (cached)");
+        }
+        text
     }
+}
+
+#[derive(Debug, Default)]
+pub struct DeviceSnapshotCache {
+    entries: HashMap<DeviceSnapshotKey, CachedDeviceReport>,
+}
+
+impl DeviceSnapshotCache {
+    pub fn apply(&mut self, devices: &mut [DeviceSnapshot]) {
+        let mut visible = HashSet::new();
+        for device in devices {
+            let key = DeviceSnapshotKey::from_snapshot(device);
+            visible.insert(key);
+
+            if let Some(cached) = self.entries.get(&key).copied() {
+                if device.current_rate.is_none() {
+                    if let Some(rate) = cached.current_rate {
+                        device.current_rate = Some(rate);
+                        device.cached_rate = true;
+                    }
+                }
+                if device.battery.is_none() {
+                    if let Some(battery) = cached.battery {
+                        device.battery = Some(battery);
+                        device.cached_battery = true;
+                    }
+                }
+            }
+
+            let entry = self.entries.entry(key).or_default();
+            if device.current_rate.is_some() && !device.cached_rate {
+                entry.current_rate = device.current_rate;
+            }
+            if device.battery.is_some() && !device.cached_battery {
+                entry.battery = device.battery;
+            }
+        }
+
+        self.entries.retain(|key, _| visible.contains(key));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DeviceSnapshotKey {
+    vid: u16,
+    pid: u16,
+    connection: ConnectionKind,
+}
+
+impl DeviceSnapshotKey {
+    fn from_snapshot(device: &DeviceSnapshot) -> Self {
+        Self {
+            vid: device.vid,
+            pid: device.pid,
+            connection: device.connection,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CachedDeviceReport {
+    current_rate: Option<PollingRate>,
+    battery: Option<BatteryStatus>,
 }
 
 pub struct HidPollMonitor {
@@ -86,6 +160,8 @@ impl HidPollMonitor {
                 supported_rates: model.supported_rates(connection).to_vec(),
                 current_rate: probe.current_rate,
                 battery: probe.battery,
+                cached_rate: false,
+                cached_battery: false,
                 battery_error: probe.battery_error,
                 read_error: probe.read_error,
             };
@@ -662,5 +738,72 @@ mod tests {
         let mut report = build_eeprom16_set_rate(PollingRate::Hz8000);
         write_report8_crc(&mut report);
         assert_eq!(report[15], 239);
+    }
+
+    #[test]
+    fn snapshot_cache_reuses_last_valid_report() {
+        let mut cache = DeviceSnapshotCache::default();
+        let mut fresh = vec![test_snapshot(
+            Some(PollingRate::Hz4000),
+            Some(BatteryStatus::level_only(82)),
+        )];
+        cache.apply(&mut fresh);
+
+        let mut sleeping = vec![test_snapshot(None, None)];
+        sleeping[0].read_error = Some("failed to send feature report".to_string());
+        cache.apply(&mut sleeping);
+
+        assert_eq!(sleeping[0].current_rate, Some(PollingRate::Hz4000));
+        assert_eq!(sleeping[0].battery, Some(BatteryStatus::level_only(82)));
+        assert!(sleeping[0].cached_rate);
+        assert!(sleeping[0].cached_battery);
+    }
+
+    #[test]
+    fn snapshot_cache_updates_live_rate_without_forgetting_battery() {
+        let mut cache = DeviceSnapshotCache::default();
+        let mut initial = vec![test_snapshot(
+            Some(PollingRate::Hz1000),
+            Some(BatteryStatus::level_only(70)),
+        )];
+        cache.apply(&mut initial);
+
+        let mut partial = vec![test_snapshot(Some(PollingRate::Hz4000), None)];
+        partial[0].battery_error = Some("battery asleep".to_string());
+        cache.apply(&mut partial);
+
+        assert_eq!(partial[0].current_rate, Some(PollingRate::Hz4000));
+        assert_eq!(partial[0].battery, Some(BatteryStatus::level_only(70)));
+        assert!(!partial[0].cached_rate);
+        assert!(partial[0].cached_battery);
+
+        let mut sleeping = vec![test_snapshot(None, None)];
+        cache.apply(&mut sleeping);
+
+        assert_eq!(sleeping[0].current_rate, Some(PollingRate::Hz4000));
+        assert_eq!(sleeping[0].battery, Some(BatteryStatus::level_only(70)));
+    }
+
+    fn test_snapshot(
+        current_rate: Option<PollingRate>,
+        battery: Option<BatteryStatus>,
+    ) -> DeviceSnapshot {
+        DeviceSnapshot {
+            path: "test".to_string(),
+            vid: 0x1234,
+            pid: 0x5678,
+            product_name: None,
+            vendor_name: "Test",
+            model_name: "Mouse",
+            connection: ConnectionKind::Wireless,
+            protocol: ProtocolKind::IpiPixV1 { report_id: 3 },
+            supported_rates: vec![PollingRate::Hz1000, PollingRate::Hz4000],
+            current_rate,
+            battery,
+            cached_rate: false,
+            cached_battery: false,
+            battery_error: None,
+            read_error: None,
+        }
     }
 }

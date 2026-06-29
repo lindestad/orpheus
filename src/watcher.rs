@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use crate::{
     config::{PollMonitorConfig, PowerPolicy},
     devices::{ConnectionKind, PollingRate},
-    hid_device::{DeviceSnapshot, HidPollMonitor},
+    hid_device::{DeviceSnapshot, DeviceSnapshotCache, HidPollMonitor},
     process_rules::{ActiveRule, ProcessScanner},
 };
 
@@ -68,6 +68,7 @@ pub fn run_watch(config: PollMonitorConfig, dry_run: bool, once: bool) -> Result
     let mut last_desired = None;
     let mut pending_restore = None;
     let mut battery_trends = BatteryTrendTracker::from_config(&config);
+    let mut snapshot_cache = DeviceSnapshotCache::default();
 
     loop {
         let active = scanner.active_rule(&config.rules);
@@ -90,6 +91,7 @@ pub fn run_watch(config: PollMonitorConfig, dry_run: bool, once: bool) -> Result
                     dry_run,
                     &config,
                     &mut battery_trends,
+                    &mut snapshot_cache,
                     active.as_ref(),
                     &desired,
                 )
@@ -234,11 +236,13 @@ fn apply_power_policy(
     dry_run: bool,
     config: &PollMonitorConfig,
     battery_trends: &mut BatteryTrendTracker,
+    snapshot_cache: &mut DeviceSnapshotCache,
     active: Option<&ActiveRule>,
     desired: &DesiredRate,
 ) -> Result<()> {
     let monitor = monitor.expect("power-aware watcher must have a monitor");
-    let devices = monitor.scan()?;
+    let mut devices = monitor.scan()?;
+    snapshot_cache.apply(&mut devices);
     if devices.is_empty() {
         if dry_run {
             println!("dry run: no supported device visible for {desired}");
@@ -354,6 +358,25 @@ fn apply_snapshot_rate(
     }
 
     if snapshot.current_rate == Some(target) {
+        return Ok(());
+    }
+
+    if snapshot.cached_rate {
+        if dry_run {
+            println!(
+                "dry run: would defer setting {} {} {:04x}:{:04x} {} -> {} ({reason}, cached report, battery {})",
+                snapshot.vendor_name,
+                snapshot.model_name,
+                snapshot.vid,
+                snapshot.pid,
+                snapshot
+                    .current_rate
+                    .map(|rate| rate.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                target,
+                snapshot.battery_text()
+            );
+        }
         return Ok(());
     }
 
@@ -674,6 +697,8 @@ mod tests {
             supported_rates: vec![PollingRate::Hz1000, PollingRate::Hz4000],
             current_rate: Some(PollingRate::Hz1000),
             battery: Some(battery),
+            cached_rate: false,
+            cached_battery: false,
             battery_error: None,
             read_error: None,
         }

@@ -112,4 +112,5 @@ For devices that report battery level but not charge state, the watcher treats `
 - The watcher scans processes at `scan_interval_ms`, with a minimum interval of 250 ms.
 - In first-device mode, the watcher writes only when the desired rule target changes.
 - In active-non-charging mode, the watcher polls device power state on each process scan and writes only when a device is not already at its target rate.
+- Long-running TUI and watcher sessions keep the last valid rate and battery report for visible devices. If a device is still enumerated but stops answering control reads, the cached report is used for display and power policy decisions. The watcher defers writes when the current rate is only cached and does not match the target, so a sleeping device has to answer again before being changed.
 - The long-term path is to keep this HID/control core and add a system tray UI around it later.

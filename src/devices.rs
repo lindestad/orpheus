@@ -322,7 +322,7 @@ impl fmt::Display for ProtocolKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ConnectionKind {
     Wired,
     Wireless,

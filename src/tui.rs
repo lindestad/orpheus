@@ -20,7 +20,7 @@ use ratatui::{
 
 use crate::{
     devices::{BatteryStatus, ChargeState, PollingRate},
-    hid_device::{DeviceSnapshot, HidPollMonitor},
+    hid_device::{DeviceSnapshot, DeviceSnapshotCache, HidPollMonitor},
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
@@ -81,6 +81,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 #[derive(Debug)]
 struct TuiApp {
     devices: Vec<DeviceSnapshot>,
+    snapshot_cache: DeviceSnapshotCache,
     selected_device: usize,
     target_rate: Option<PollingRate>,
     target_dirty: bool,
@@ -92,6 +93,7 @@ impl TuiApp {
     fn new() -> Self {
         Self {
             devices: Vec::new(),
+            snapshot_cache: DeviceSnapshotCache::default(),
             selected_device: 0,
             target_rate: None,
             target_dirty: false,
@@ -107,7 +109,8 @@ impl TuiApp {
     fn refresh(&mut self, monitor: &HidPollMonitor) {
         self.last_refresh = Instant::now();
         match monitor.scan() {
-            Ok(devices) => {
+            Ok(mut devices) => {
+                self.snapshot_cache.apply(&mut devices);
                 self.devices = devices;
                 if self.selected_device >= self.devices.len() {
                     self.selected_device = 0;
@@ -180,6 +183,25 @@ impl TuiApp {
             self.status = "no target rate selected".to_string();
             return;
         };
+
+        if device.current_rate == Some(rate) {
+            self.target_dirty = false;
+            self.status = if device.cached_rate {
+                format!("current rate cached as {rate}; no write needed")
+            } else {
+                format!("already at {rate}")
+            };
+            return;
+        }
+
+        if device.cached_rate {
+            let current = device
+                .current_rate
+                .map(|rate| rate.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            self.status = format!("set deferred: latest rate read is cached as {current}");
+            return;
+        }
 
         match monitor
             .open_by_vid_pid(device.vid, device.pid)
@@ -289,23 +311,28 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
 
     let rows = app.devices.iter().enumerate().map(|(idx, device)| {
-        let current = device
-            .current_rate
-            .map(|rate| rate.hz().to_string())
-            .unwrap_or_else(|| "-".to_string());
+        let current = current_rate_summary(device);
         let power = power_summary(device);
-        let status = device
-            .read_error
-            .as_ref()
-            .map(|_| "read error")
-            .or_else(|| device.battery_error.as_ref().map(|_| "battery"))
-            .unwrap_or("ok");
+        let status = if device.cached_rate || device.cached_battery {
+            "cached"
+        } else {
+            device
+                .read_error
+                .as_ref()
+                .map(|_| "read error")
+                .or_else(|| device.battery_error.as_ref().map(|_| "battery"))
+                .unwrap_or("ok")
+        };
         let style = if idx == app.selected_device {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
-        } else if device.read_error.is_some() || device.battery_error.is_some() {
+        } else if device.read_error.is_some()
+            || device.battery_error.is_some()
+            || device.cached_rate
+            || device.cached_battery
+        {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default()
@@ -371,10 +398,7 @@ fn draw_rate_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         return;
     };
 
-    let current = device
-        .current_rate
-        .map(|rate| rate.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let current = current_rate_detail(device);
     let target = app
         .target_rate
         .map(|rate| rate.to_string())
@@ -460,7 +484,7 @@ fn power_detail(device: &DeviceSnapshot) -> String {
         return device.battery_text();
     };
 
-    match battery.charge_state {
+    let mut text = match battery.charge_state {
         ChargeState::Charging => {
             format!("{} {CHARGING_ICON} charging", battery_level_text(battery))
         }
@@ -474,7 +498,11 @@ fn power_detail(device: &DeviceSnapshot) -> String {
             }
         }
         ChargeState::Raw(raw) => format!("{} raw state {raw}", battery_level_text(battery)),
+    };
+    if device.cached_battery {
+        text.push_str(" (cached)");
     }
+    text
 }
 
 fn battery_level_text(battery: BatteryStatus) -> String {
@@ -482,6 +510,28 @@ fn battery_level_text(battery: BatteryStatus) -> String {
         .level_percent
         .map(|level| format!("{level}%"))
         .unwrap_or_else(|| "level unknown".to_string())
+}
+
+fn current_rate_summary(device: &DeviceSnapshot) -> String {
+    let Some(rate) = device.current_rate else {
+        return "-".to_string();
+    };
+    if device.cached_rate {
+        format!("{}*", rate.hz())
+    } else {
+        rate.hz().to_string()
+    }
+}
+
+fn current_rate_detail(device: &DeviceSnapshot) -> String {
+    let Some(rate) = device.current_rate else {
+        return "unknown".to_string();
+    };
+    if device.cached_rate {
+        format!("{rate} (cached)")
+    } else {
+        rate.to_string()
+    }
 }
 
 fn rate_line(rates: &[PollingRate], selected: Option<PollingRate>) -> Line<'static> {
@@ -579,6 +629,8 @@ mod tests {
             supported_rates: vec![PollingRate::Hz1000],
             current_rate: Some(PollingRate::Hz1000),
             battery,
+            cached_rate: false,
+            cached_battery: false,
             battery_error: None,
             read_error: None,
         }
