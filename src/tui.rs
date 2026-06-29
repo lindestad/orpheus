@@ -19,11 +19,12 @@ use ratatui::{
 };
 
 use crate::{
-    devices::{BatteryStatus, ChargeState, PollingRate},
+    devices::{BatteryStatus, ChargeState, ConnectionKind, PollingRate},
     hid_device::{DeviceSnapshot, DeviceSnapshotCache, HidPollMonitor},
 };
 
-const REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
+const REFRESH_INTERVAL: Duration = Duration::from_millis(5_000);
+const PENDING_RETRY_INTERVAL: Duration = Duration::from_millis(1_000);
 const CHARGING_ICON: &str = "⚡";
 
 pub fn run_tui() -> Result<()> {
@@ -82,6 +83,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 struct TuiApp {
     devices: Vec<DeviceSnapshot>,
     snapshot_cache: DeviceSnapshotCache,
+    pending_rate: Option<PendingTuiRateChange>,
     selected_device: usize,
     target_rate: Option<PollingRate>,
     target_dirty: bool,
@@ -94,6 +96,7 @@ impl TuiApp {
         Self {
             devices: Vec::new(),
             snapshot_cache: DeviceSnapshotCache::default(),
+            pending_rate: None,
             selected_device: 0,
             target_rate: None,
             target_dirty: false,
@@ -103,7 +106,15 @@ impl TuiApp {
     }
 
     fn should_refresh(&self) -> bool {
-        self.last_refresh.elapsed() >= REFRESH_INTERVAL
+        self.last_refresh.elapsed() >= self.refresh_interval()
+    }
+
+    fn refresh_interval(&self) -> Duration {
+        if self.pending_rate.is_some() {
+            PENDING_RETRY_INTERVAL
+        } else {
+            REFRESH_INTERVAL
+        }
     }
 
     fn refresh(&mut self, monitor: &HidPollMonitor) {
@@ -122,6 +133,7 @@ impl TuiApp {
                 } else {
                     format!("{} device(s), refreshed now", self.devices.len())
                 };
+                self.try_pending_rate(monitor);
             }
             Err(err) => {
                 self.devices.clear();
@@ -191,15 +203,17 @@ impl TuiApp {
             } else {
                 format!("already at {rate}")
             };
+            self.clear_pending_for(&device);
             return;
         }
 
-        if device.cached_rate {
+        if device.cached_rate || device.current_rate.is_none() {
+            self.queue_pending_rate(&device, rate);
             let current = device
                 .current_rate
                 .map(|rate| rate.to_string())
                 .unwrap_or_else(|| "unknown".to_string());
-            self.status = format!("set deferred: latest rate read is cached as {current}");
+            self.status = format!("set queued: latest rate read is {current}");
             return;
         }
 
@@ -211,13 +225,23 @@ impl TuiApp {
                 live.read_rate().map(|after| (live.connection(), after))
             }) {
             Ok((connection, after)) => {
-                self.target_dirty = false;
-                let status = format!("set {connection} to {after}");
+                if after == rate {
+                    self.clear_pending_for(&device);
+                    self.target_dirty = false;
+                } else {
+                    self.queue_pending_rate(&device, rate);
+                }
+                let status = if after == rate {
+                    format!("set {connection} to {after}")
+                } else {
+                    format!("set queued: {connection} is still {after}")
+                };
                 self.refresh(monitor);
                 self.status = status;
             }
             Err(err) => {
-                self.status = format!("set failed: {err}");
+                self.queue_pending_rate(&device, rate);
+                self.status = format!("set queued: {err}");
             }
         }
     }
@@ -255,6 +279,91 @@ impl TuiApp {
             })
             .or_else(|| supported.first().copied());
         self.target_dirty = false;
+    }
+
+    fn try_pending_rate(&mut self, monitor: &HidPollMonitor) {
+        let Some(pending) = self.pending_rate.clone() else {
+            return;
+        };
+        let Some(device) = self
+            .devices
+            .iter()
+            .find(|device| pending.matches(device))
+            .cloned()
+        else {
+            self.status = format!("queued {}: device not visible", pending.target);
+            return;
+        };
+
+        if device.current_rate == Some(pending.target) {
+            self.pending_rate = None;
+            self.status = format!("queued target {} is now satisfied", pending.target);
+            return;
+        }
+
+        if device.cached_rate || device.current_rate.is_none() {
+            let current = device
+                .current_rate
+                .map(|rate| rate.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            self.status = format!("queued {}: latest rate read is {current}", pending.target);
+            return;
+        }
+
+        match monitor
+            .open_by_vid_pid(device.vid, device.pid)
+            .and_then(|live| {
+                live.set_rate(pending.target)?;
+                std::thread::sleep(Duration::from_millis(80));
+                live.read_rate().map(|after| (live.connection(), after))
+            }) {
+            Ok((connection, after)) => {
+                if after == pending.target {
+                    self.pending_rate = None;
+                    self.target_dirty = false;
+                    self.status = format!("set queued {connection} target to {after}");
+                } else {
+                    self.status =
+                        format!("queued {}: {connection} is still {after}", pending.target);
+                }
+            }
+            Err(err) => {
+                self.status = format!("queued {}: {err}", pending.target);
+            }
+        }
+    }
+
+    fn queue_pending_rate(&mut self, device: &DeviceSnapshot, target: PollingRate) {
+        self.pending_rate = Some(PendingTuiRateChange {
+            vid: device.vid,
+            pid: device.pid,
+            connection: device.connection,
+            target,
+        });
+    }
+
+    fn clear_pending_for(&mut self, device: &DeviceSnapshot) {
+        if self
+            .pending_rate
+            .as_ref()
+            .is_some_and(|pending| pending.matches(device))
+        {
+            self.pending_rate = None;
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingTuiRateChange {
+    vid: u16,
+    pid: u16,
+    connection: ConnectionKind,
+    target: PollingRate,
+}
+
+impl PendingTuiRateChange {
+    fn matches(&self, device: &DeviceSnapshot) -> bool {
+        self.vid == device.vid && self.pid == device.pid && self.connection == device.connection
     }
 }
 
@@ -574,11 +683,11 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
     let refresh = format!(
         "auto-refresh {} ms",
-        REFRESH_INTERVAL.as_millis().saturating_sub(
+        app.refresh_interval().as_millis().saturating_sub(
             app.last_refresh
                 .elapsed()
                 .as_millis()
-                .min(REFRESH_INTERVAL.as_millis())
+                .min(app.refresh_interval().as_millis())
         )
     );
 
@@ -614,6 +723,21 @@ mod tests {
     fn power_detail_keeps_state_text() {
         let device = test_device(Some(BatteryStatus::level_only(100)));
         assert_eq!(power_detail(&device), "100% (state unknown)");
+    }
+
+    #[test]
+    fn pending_rate_uses_retry_refresh_interval() {
+        let mut app = TuiApp::new();
+        assert_eq!(app.refresh_interval(), REFRESH_INTERVAL);
+
+        app.pending_rate = Some(PendingTuiRateChange {
+            vid: 0x1234,
+            pid: 0x5678,
+            connection: ConnectionKind::Wireless,
+            target: PollingRate::Hz4000,
+        });
+
+        assert_eq!(app.refresh_interval(), PENDING_RETRY_INTERVAL);
     }
 
     fn test_device(battery: Option<BatteryStatus>) -> DeviceSnapshot {

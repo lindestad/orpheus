@@ -14,6 +14,9 @@ pub struct PollMonitorConfig {
     pub default_rate: PollingRate,
     pub restore_rate: Option<PollingRate>,
     pub scan_interval_ms: u64,
+    pub pending_retry_interval_ms: u64,
+    pub active_device_poll_interval_ms: u64,
+    pub background_device_poll_interval_ms: u64,
     pub power_policy: PowerPolicy,
     pub battery_trend_window_ms: u64,
     pub battery_trend_min_delta: u8,
@@ -29,6 +32,9 @@ impl Default for PollMonitorConfig {
             default_rate: PollingRate::Hz8000,
             restore_rate: Some(PollingRate::Hz8000),
             scan_interval_ms: 1_000,
+            pending_retry_interval_ms: 1_000,
+            active_device_poll_interval_ms: 5_000,
+            background_device_poll_interval_ms: 600_000,
             power_policy: PowerPolicy::FirstDevice,
             battery_trend_window_ms: 600_000,
             battery_trend_min_delta: 1,
@@ -83,6 +89,9 @@ pub const EXAMPLE_CONFIG: &str = r#"# poll-monitor config
 default_rate = 1000
 restore_rate = 1000
 scan_interval_ms = 1000
+pending_retry_interval_ms = 1000
+active_device_poll_interval_ms = 5000
+background_device_poll_interval_ms = 600000
 power_policy = "active-non-charging"
 battery_trend_window_ms = 600000
 battery_trend_min_delta = 1
@@ -142,6 +151,9 @@ rate = "4k"
         assert_eq!(config.power_policy, PowerPolicy::ActiveNonCharging);
         assert_eq!(config.battery_trend_window_ms, 600_000);
         assert_eq!(config.battery_trend_min_delta, 1);
+        assert_eq!(config.pending_retry_interval_ms, 1_000);
+        assert_eq!(config.active_device_poll_interval_ms, 5_000);
+        assert_eq!(config.background_device_poll_interval_ms, 600_000);
         assert!(config.assume_wired_is_charging);
         assert!(config.assume_wireless_is_discharging);
         assert_eq!(config.rules[0].rate, PollingRate::Hz4000);

@@ -57,7 +57,7 @@ pub fn desired_rate(
 }
 
 pub fn run_watch(config: PollMonitorConfig, dry_run: bool, once: bool) -> Result<()> {
-    let interval = Duration::from_millis(config.scan_interval_ms.max(250));
+    let process_interval = Duration::from_millis(config.scan_interval_ms.max(250));
     let needs_monitor = !dry_run || config.power_policy == PowerPolicy::ActiveNonCharging;
     let monitor = if needs_monitor {
         Some(HidPollMonitor::new()?)
@@ -69,42 +69,69 @@ pub fn run_watch(config: PollMonitorConfig, dry_run: bool, once: bool) -> Result
     let mut pending_restore = None;
     let mut battery_trends = BatteryTrendTracker::from_config(&config);
     let mut snapshot_cache = DeviceSnapshotCache::default();
+    let mut device_scheduler = DevicePollScheduler::from_config(&config);
+    let mut pending_rate_changes = PendingRateQueue::default();
+    let mut pending_first_device = None;
 
     loop {
+        let now = Instant::now();
         let active = scanner.active_rule(&config.rules);
         if let Some(rule) = active.as_ref() {
             pending_restore = rule.restore;
         }
         let desired = desired_rate(&config, active.as_ref(), pending_restore);
+        let desired_changed = last_desired.as_ref() != Some(&desired);
 
         match config.power_policy {
             PowerPolicy::FirstDevice => {
-                if last_desired.as_ref() != Some(&desired) {
-                    apply_desired(monitor.as_ref(), dry_run, &desired)
-                        .with_context(|| format!("failed while applying {desired}"))?;
-                    last_desired = Some(desired);
+                if desired_changed {
+                    pending_first_device = Some(desired.clone());
+                }
+                if let Some(pending) = pending_first_device.as_ref() {
+                    let should_try = once
+                        || desired_changed
+                        || device_scheduler.should_poll(now, active.is_some(), true, false);
+                    if should_try {
+                        match apply_desired(monitor.as_ref(), dry_run, pending) {
+                            Ok(()) => pending_first_device = None,
+                            Err(err) => println!("queued {pending}: {err}"),
+                        }
+                        device_scheduler.record_poll(now);
+                    }
                 }
             }
             PowerPolicy::ActiveNonCharging => {
-                apply_power_policy(
-                    monitor.as_ref(),
-                    dry_run,
-                    &config,
-                    &mut battery_trends,
-                    &mut snapshot_cache,
-                    active.as_ref(),
-                    &desired,
-                )
-                .with_context(|| format!("failed while applying power policy for {desired}"))?;
-                last_desired = Some(desired);
+                let should_poll_devices = once
+                    || device_scheduler.should_poll(
+                        now,
+                        active.is_some(),
+                        pending_rate_changes.has_pending(),
+                        desired_changed,
+                    );
+                if should_poll_devices {
+                    apply_power_policy(
+                        monitor.as_ref(),
+                        dry_run,
+                        &config,
+                        &mut battery_trends,
+                        &mut snapshot_cache,
+                        &mut pending_rate_changes,
+                        active.as_ref(),
+                        &desired,
+                    )
+                    .with_context(|| format!("failed while applying power policy for {desired}"))?;
+                    device_scheduler.record_poll(now);
+                }
             }
         }
+        last_desired = Some(desired);
 
         if once {
             break;
         }
 
-        thread::sleep(interval);
+        let has_pending = pending_first_device.is_some() || pending_rate_changes.has_pending();
+        thread::sleep(device_scheduler.sleep_interval(process_interval, has_pending));
     }
 
     Ok(())
@@ -115,6 +142,71 @@ enum PowerClass {
     Charging,
     Discharging,
     Unknown,
+}
+
+#[derive(Debug)]
+struct DevicePollScheduler {
+    pending_retry_interval: Duration,
+    active_poll_interval: Duration,
+    background_poll_interval: Duration,
+    last_poll: Option<Instant>,
+}
+
+impl DevicePollScheduler {
+    fn from_config(config: &PollMonitorConfig) -> Self {
+        Self {
+            pending_retry_interval: Duration::from_millis(
+                config.pending_retry_interval_ms.max(250),
+            ),
+            active_poll_interval: Duration::from_millis(
+                config.active_device_poll_interval_ms.max(1_000),
+            ),
+            background_poll_interval: Duration::from_millis(
+                config.background_device_poll_interval_ms.max(60_000),
+            ),
+            last_poll: None,
+        }
+    }
+
+    fn should_poll(
+        &self,
+        now: Instant,
+        active: bool,
+        has_pending: bool,
+        desired_changed: bool,
+    ) -> bool {
+        if desired_changed {
+            return true;
+        }
+
+        let Some(last_poll) = self.last_poll else {
+            return true;
+        };
+
+        now.duration_since(last_poll) >= self.interval_for(active, has_pending)
+    }
+
+    fn record_poll(&mut self, now: Instant) {
+        self.last_poll = Some(now);
+    }
+
+    fn sleep_interval(&self, process_interval: Duration, has_pending: bool) -> Duration {
+        if has_pending {
+            process_interval.min(self.pending_retry_interval)
+        } else {
+            process_interval
+        }
+    }
+
+    fn interval_for(&self, active: bool, has_pending: bool) -> Duration {
+        if has_pending {
+            self.pending_retry_interval
+        } else if active {
+            self.active_poll_interval
+        } else {
+            self.background_poll_interval
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -131,6 +223,72 @@ impl DeviceKey {
             vid: device.vid,
             pid: device.pid,
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingRateChange {
+    target: PollingRate,
+    reason: String,
+    attempts: u32,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PendingRateQueue {
+    changes: HashMap<DeviceKey, PendingRateChange>,
+}
+
+impl PendingRateQueue {
+    fn has_pending(&self) -> bool {
+        !self.changes.is_empty()
+    }
+
+    fn queue(
+        &mut self,
+        device: &DeviceSnapshot,
+        target: PollingRate,
+        reason: &str,
+        error: Option<String>,
+    ) -> bool {
+        let key = DeviceKey::from_snapshot(device);
+        let next = PendingRateChange {
+            target,
+            reason: reason.to_string(),
+            attempts: 1,
+            last_error: error,
+        };
+
+        match self.changes.get_mut(&key) {
+            Some(existing)
+                if existing.target == next.target
+                    && existing.reason == next.reason
+                    && existing.last_error == next.last_error =>
+            {
+                existing.attempts = existing.attempts.saturating_add(1);
+                false
+            }
+            Some(existing) => {
+                *existing = next;
+                true
+            }
+            None => {
+                self.changes.insert(key, next);
+                true
+            }
+        }
+    }
+
+    fn clear(&mut self, device: &DeviceSnapshot) -> Option<PendingRateChange> {
+        self.changes.remove(&DeviceKey::from_snapshot(device))
+    }
+
+    fn retain_visible(&mut self, devices: &[DeviceSnapshot]) {
+        let visible = devices
+            .iter()
+            .map(DeviceKey::from_snapshot)
+            .collect::<HashSet<_>>();
+        self.changes.retain(|key, _| visible.contains(key));
     }
 }
 
@@ -237,12 +395,14 @@ fn apply_power_policy(
     config: &PollMonitorConfig,
     battery_trends: &mut BatteryTrendTracker,
     snapshot_cache: &mut DeviceSnapshotCache,
+    pending_changes: &mut PendingRateQueue,
     active: Option<&ActiveRule>,
     desired: &DesiredRate,
 ) -> Result<()> {
     let monitor = monitor.expect("power-aware watcher must have a monitor");
     let mut devices = monitor.scan()?;
     snapshot_cache.apply(&mut devices);
+    pending_changes.retain_visible(&devices);
     if devices.is_empty() {
         if dry_run {
             println!("dry run: no supported device visible for {desired}");
@@ -263,9 +423,6 @@ fn apply_power_policy(
     let has_known_discharging = classes.contains(&PowerClass::Discharging);
 
     for (device, class) in devices.iter().zip(classes) {
-        if device.current_rate.is_none() {
-            continue;
-        }
         let (target, reason) = power_target_rate(
             active,
             desired.rate,
@@ -274,7 +431,7 @@ fn apply_power_policy(
             has_known_discharging,
             config.allow_unknown_power_active,
         );
-        apply_snapshot_rate(monitor, dry_run, device, target, reason)?;
+        apply_snapshot_rate(monitor, dry_run, pending_changes, device, target, reason)?;
     }
 
     Ok(())
@@ -345,6 +502,7 @@ fn power_target_rate(
 fn apply_snapshot_rate(
     monitor: &HidPollMonitor,
     dry_run: bool,
+    pending_changes: &mut PendingRateQueue,
     snapshot: &DeviceSnapshot,
     target: PollingRate,
     reason: &str,
@@ -354,17 +512,48 @@ fn apply_snapshot_rate(
             "{} {} {:04x}:{:04x}: skipping unsupported target {} ({reason})",
             snapshot.vendor_name, snapshot.model_name, snapshot.vid, snapshot.pid, target
         );
+        pending_changes.clear(snapshot);
         return Ok(());
     }
 
     if snapshot.current_rate == Some(target) {
+        if let Some(pending) = pending_changes.clear(snapshot) {
+            println!(
+                "{} {} {:04x}:{:04x}: queued target {} is now satisfied ({})",
+                snapshot.vendor_name,
+                snapshot.model_name,
+                snapshot.vid,
+                snapshot.pid,
+                pending.target,
+                pending.reason
+            );
+        }
         return Ok(());
     }
 
-    if snapshot.cached_rate {
+    if snapshot.cached_rate || snapshot.current_rate.is_none() {
+        let detail = if snapshot.cached_rate {
+            "latest rate read is cached"
+        } else {
+            "current rate is unknown"
+        };
         if dry_run {
             println!(
-                "dry run: would defer setting {} {} {:04x}:{:04x} {} -> {} ({reason}, cached report, battery {})",
+                "dry run: would queue {} {} {:04x}:{:04x} {} -> {} ({reason}, {detail}, battery {})",
+                snapshot.vendor_name,
+                snapshot.model_name,
+                snapshot.vid,
+                snapshot.pid,
+                snapshot
+                    .current_rate
+                    .map(|rate| rate.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                target,
+                snapshot.battery_text()
+            );
+        } else if pending_changes.queue(snapshot, target, reason, Some(detail.to_string())) {
+            println!(
+                "queued {} {} {:04x}:{:04x} {} -> {} ({reason}, {detail}, battery {})",
                 snapshot.vendor_name,
                 snapshot.model_name,
                 snapshot.vid,
@@ -398,27 +587,63 @@ fn apply_snapshot_rate(
     }
 
     let started = Instant::now();
-    let device = monitor.open_by_vid_pid(snapshot.vid, snapshot.pid)?;
-    let before = device.read_rate().ok().or(snapshot.current_rate);
-    if before != Some(target) {
-        device.set_rate(target)?;
-        thread::sleep(Duration::from_millis(80));
+    match monitor
+        .open_by_vid_pid(snapshot.vid, snapshot.pid)
+        .and_then(|device| {
+            let before = device.read_rate().ok().or(snapshot.current_rate);
+            if before != Some(target) {
+                device.set_rate(target)?;
+                thread::sleep(Duration::from_millis(80));
+            }
+            let after = device.read_rate().ok();
+            Ok((before, after))
+        }) {
+        Ok((before, after)) => {
+            let confirmed = after == Some(target);
+            if confirmed {
+                pending_changes.clear(snapshot);
+            } else {
+                let detail = after
+                    .map(|rate| format!("device confirmed {rate} after write"))
+                    .unwrap_or_else(|| "post-write read did not confirm target".to_string());
+                pending_changes.queue(snapshot, target, reason, Some(detail));
+            }
+            println!(
+                "{} {} {:04x}:{:04x}: {} -> {} ({reason}, battery {}, {} ms{})",
+                snapshot.vendor_name,
+                snapshot.model_name,
+                snapshot.vid,
+                snapshot.pid,
+                before
+                    .map(|rate| rate.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                after
+                    .map(|rate| rate.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                snapshot.battery_text(),
+                started.elapsed().as_millis(),
+                if confirmed { "" } else { ", queued" }
+            );
+        }
+        Err(err) => {
+            let detail = err.to_string();
+            if pending_changes.queue(snapshot, target, reason, Some(detail.clone())) {
+                println!(
+                    "queued {} {} {:04x}:{:04x} {} -> {} ({reason}, {detail}, battery {})",
+                    snapshot.vendor_name,
+                    snapshot.model_name,
+                    snapshot.vid,
+                    snapshot.pid,
+                    snapshot
+                        .current_rate
+                        .map(|rate| rate.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    target,
+                    snapshot.battery_text()
+                );
+            }
+        }
     }
-    let after = device.read_rate().unwrap_or(target);
-
-    println!(
-        "{} {} {:04x}:{:04x}: {} -> {} ({reason}, battery {}, {} ms)",
-        snapshot.vendor_name,
-        snapshot.model_name,
-        snapshot.vid,
-        snapshot.pid,
-        before
-            .map(|rate| rate.to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
-        after,
-        snapshot.battery_text(),
-        started.elapsed().as_millis()
-    );
     Ok(())
 }
 
@@ -554,6 +779,57 @@ mod tests {
             ),
             (PollingRate::Hz1000, "unknown-power idle")
         );
+    }
+
+    #[test]
+    fn device_scheduler_uses_expected_poll_intervals() {
+        let config = PollMonitorConfig::default();
+        let mut scheduler = DevicePollScheduler::from_config(&config);
+        let now = Instant::now();
+
+        assert!(scheduler.should_poll(now, false, false, false));
+        scheduler.record_poll(now);
+
+        assert!(scheduler.should_poll(now + Duration::from_secs(1), false, true, false));
+        assert!(!scheduler.should_poll(now + Duration::from_secs(4), true, false, false));
+        assert!(scheduler.should_poll(now + Duration::from_secs(5), true, false, false));
+        assert!(!scheduler.should_poll(now + Duration::from_secs(599), false, false, false));
+        assert!(scheduler.should_poll(now + Duration::from_secs(600), false, false, false));
+        assert!(scheduler.should_poll(now + Duration::from_millis(1), false, false, true));
+    }
+
+    #[test]
+    fn pending_rate_queue_updates_target_and_retain_visible() {
+        let device = test_device(
+            IPI_VENDOR_ID,
+            0x1014,
+            ProtocolKind::IpiPixV1 { report_id: 3 },
+            BatteryStatus::level_only(80),
+        );
+        let mut queue = PendingRateQueue::default();
+
+        assert!(queue.queue(
+            &device,
+            PollingRate::Hz4000,
+            "active non-charging",
+            Some("latest rate read is cached".to_string())
+        ));
+        assert!(queue.has_pending());
+        assert!(!queue.queue(
+            &device,
+            PollingRate::Hz4000,
+            "active non-charging",
+            Some("latest rate read is cached".to_string())
+        ));
+        assert!(queue.queue(&device, PollingRate::Hz1000, "idle", None));
+
+        let pending = queue.clear(&device).unwrap();
+        assert_eq!(pending.target, PollingRate::Hz1000);
+        assert_eq!(pending.reason, "idle");
+
+        queue.queue(&device, PollingRate::Hz4000, "active non-charging", None);
+        queue.retain_visible(&[]);
+        assert!(!queue.has_pending());
     }
 
     #[test]

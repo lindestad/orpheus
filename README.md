@@ -84,6 +84,9 @@ For a two-mouse setup where the idle mouse is charging and the active mouse shou
 default_rate = 1000
 restore_rate = 1000
 scan_interval_ms = 1000
+pending_retry_interval_ms = 1000
+active_device_poll_interval_ms = 5000
+background_device_poll_interval_ms = 600000
 power_policy = "active-non-charging"
 battery_trend_window_ms = 600000
 battery_trend_min_delta = 1
@@ -101,7 +104,9 @@ Rules are checked in file order. The first matching process wins. Process names 
 
 Rates can be written as numbers (`1000`, `8000`) or shorthand strings (`"1k"`, `"8k"`).
 
-`power_policy = "first-device"` keeps the original behavior: the watcher only changes the first supported device when the active rule changes. `power_policy = "active-non-charging"` scans supported devices every watcher tick. While a rule is active it applies the rule rate to non-charging devices and keeps charging devices at the idle rate.
+`power_policy = "first-device"` keeps the original behavior: the watcher only changes the first supported device when the active rule changes. `power_policy = "active-non-charging"` manages every supported device. While a rule is active it applies the rule rate to non-charging devices and keeps charging devices at the idle rate.
+
+`scan_interval_ms` controls process scanning. HID device reads are paced separately: `pending_retry_interval_ms` is used while a rate change is queued, `active_device_poll_interval_ms` is used while a target process is active and no change is queued, and `background_device_poll_interval_ms` is used when no target process is active. Rule changes still force an immediate device read.
 
 For devices that report battery level but not charge state, the watcher treats `100%` as plugged in, then falls back to a rolling battery trend. If the level increases by at least `battery_trend_min_delta` within `battery_trend_window_ms`, the device is treated as charging. If neither signal is available, the connection assumptions are used as a final fallback.
 
@@ -109,8 +114,9 @@ For devices that report battery level but not charge state, the watcher treats `
 
 - The TUI and watcher query the configured polling rate through device control reports, not by sampling pointer movement.
 - Device support is implemented as per-vendor protocol adapters under one HID monitor path.
-- The watcher scans processes at `scan_interval_ms`, with a minimum interval of 250 ms.
+- The watcher scans processes at `scan_interval_ms`, with a minimum interval of 250 ms. HID control reads are less frequent unless a rate change is pending.
 - In first-device mode, the watcher writes only when the desired rule target changes.
-- In active-non-charging mode, the watcher polls device power state on each process scan and writes only when a device is not already at its target rate.
-- Long-running TUI and watcher sessions keep the last valid rate and battery report for visible devices. If a device is still enumerated but stops answering control reads, the cached report is used for display and power policy decisions. The watcher defers writes when the current rate is only cached and does not match the target, so a sleeping device has to answer again before being changed.
+- In active-non-charging mode, the watcher queues a target rate for sleeping or temporarily unavailable devices and retries queued changes at `pending_retry_interval_ms`.
+- Long-running TUI and watcher sessions keep the last valid rate and battery report for visible devices. If a device is still enumerated but stops answering control reads, the cached report is used for display and power policy decisions. The watcher queues writes when the current rate is cached or unknown and does not match the target, so the change is retried when the device answers again.
+- The TUI refreshes device telemetry every 5 seconds by default and every 1 second while a user-initiated rate change is queued.
 - The long-term path is to keep this HID/control core and add a system tray UI around it later.

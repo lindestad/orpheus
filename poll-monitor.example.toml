@@ -2,6 +2,9 @@
 default_rate = 1000
 restore_rate = 1000
 scan_interval_ms = 1000
+pending_retry_interval_ms = 1000
+active_device_poll_interval_ms = 5000
+background_device_poll_interval_ms = 600000
 power_policy = "active-non-charging"
 battery_trend_window_ms = 600000
 battery_trend_min_delta = 1
