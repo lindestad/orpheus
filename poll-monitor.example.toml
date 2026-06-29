@@ -3,8 +3,10 @@ default_rate = 1000
 restore_rate = 1000
 scan_interval_ms = 1000
 power_policy = "active-non-charging"
+battery_trend_window_ms = 600000
+battery_trend_min_delta = 1
 assume_wired_is_charging = true
-assume_wireless_is_discharging = true
+assume_wireless_is_discharging = false
 allow_unknown_power_active = true
 
 [[rules]]

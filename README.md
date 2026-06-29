@@ -85,8 +85,10 @@ default_rate = 1000
 restore_rate = 1000
 scan_interval_ms = 1000
 power_policy = "active-non-charging"
+battery_trend_window_ms = 600000
+battery_trend_min_delta = 1
 assume_wired_is_charging = true
-assume_wireless_is_discharging = true
+assume_wireless_is_discharging = false
 allow_unknown_power_active = true
 
 [[rules]]
@@ -99,7 +101,9 @@ Rules are checked in file order. The first matching process wins. Process names 
 
 Rates can be written as numbers (`1000`, `8000`) or shorthand strings (`"1k"`, `"8k"`).
 
-`power_policy = "first-device"` keeps the original behavior: the watcher only changes the first supported device when the active rule changes. `power_policy = "active-non-charging"` scans supported devices every watcher tick. While a rule is active it applies the rule rate to non-charging devices and keeps charging devices at the idle rate. Devices with unknown power state are used as the active fallback only when no known non-charging device is visible.
+`power_policy = "first-device"` keeps the original behavior: the watcher only changes the first supported device when the active rule changes. `power_policy = "active-non-charging"` scans supported devices every watcher tick. While a rule is active it applies the rule rate to non-charging devices and keeps charging devices at the idle rate.
+
+For devices that report battery level but not charge state, the watcher treats `100%` as plugged in, then falls back to a rolling battery trend. If the level increases by at least `battery_trend_min_delta` within `battery_trend_window_ms`, the device is treated as charging. If neither signal is available, the connection assumptions are used as a final fallback.
 
 ## Design Notes
 

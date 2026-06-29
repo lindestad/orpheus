@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet, VecDeque},
     fmt, thread,
     time::{Duration, Instant},
 };
@@ -66,6 +67,7 @@ pub fn run_watch(config: PollMonitorConfig, dry_run: bool, once: bool) -> Result
     let mut scanner = ProcessScanner::new();
     let mut last_desired = None;
     let mut pending_restore = None;
+    let mut battery_trends = BatteryTrendTracker::from_config(&config);
 
     loop {
         let active = scanner.active_rule(&config.rules);
@@ -87,6 +89,7 @@ pub fn run_watch(config: PollMonitorConfig, dry_run: bool, once: bool) -> Result
                     monitor.as_ref(),
                     dry_run,
                     &config,
+                    &mut battery_trends,
                     active.as_ref(),
                     &desired,
                 )
@@ -110,6 +113,87 @@ enum PowerClass {
     Charging,
     Discharging,
     Unknown,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DeviceKey {
+    path: String,
+    vid: u16,
+    pid: u16,
+}
+
+impl DeviceKey {
+    fn from_snapshot(device: &DeviceSnapshot) -> Self {
+        Self {
+            path: device.path.clone(),
+            vid: device.vid,
+            pid: device.pid,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BatterySample {
+    at: Instant,
+    level: u8,
+}
+
+#[derive(Debug)]
+struct BatteryTrendTracker {
+    histories: HashMap<DeviceKey, VecDeque<BatterySample>>,
+    window: Duration,
+    min_delta: u8,
+}
+
+impl BatteryTrendTracker {
+    fn from_config(config: &PollMonitorConfig) -> Self {
+        Self {
+            histories: HashMap::new(),
+            window: Duration::from_millis(config.battery_trend_window_ms.max(1_000)),
+            min_delta: config.battery_trend_min_delta.max(1),
+        }
+    }
+
+    fn record(&mut self, devices: &[DeviceSnapshot]) {
+        self.record_at(devices, Instant::now());
+    }
+
+    fn record_at(&mut self, devices: &[DeviceSnapshot], now: Instant) {
+        let mut visible = HashSet::new();
+        for device in devices {
+            let key = DeviceKey::from_snapshot(device);
+            visible.insert(key.clone());
+            let Some(level) = device.battery.and_then(|battery| battery.level_percent) else {
+                continue;
+            };
+            let history = self.histories.entry(key).or_default();
+            history.push_back(BatterySample { at: now, level });
+            while history
+                .front()
+                .is_some_and(|sample| now.duration_since(sample.at) > self.window)
+            {
+                history.pop_front();
+            }
+        }
+        self.histories.retain(|key, _| visible.contains(key));
+    }
+
+    fn classify(&self, device: &DeviceSnapshot) -> Option<PowerClass> {
+        let history = self.histories.get(&DeviceKey::from_snapshot(device))?;
+        let first = history.front()?;
+        let last = history.back()?;
+        if history.len() < 2 {
+            return None;
+        }
+
+        if last.level >= first.level.saturating_add(self.min_delta) {
+            return Some(PowerClass::Charging);
+        }
+        if first.level >= last.level.saturating_add(self.min_delta) {
+            return Some(PowerClass::Discharging);
+        }
+        None
+    }
 }
 
 fn apply_desired(
@@ -149,6 +233,7 @@ fn apply_power_policy(
     monitor: Option<&HidPollMonitor>,
     dry_run: bool,
     config: &PollMonitorConfig,
+    battery_trends: &mut BatteryTrendTracker,
     active: Option<&ActiveRule>,
     desired: &DesiredRate,
 ) -> Result<()> {
@@ -161,6 +246,7 @@ fn apply_power_policy(
         }
         return Ok(());
     }
+    battery_trends.record(&devices);
 
     let idle_rate = active
         .and_then(|rule| rule.restore)
@@ -168,7 +254,7 @@ fn apply_power_policy(
         .unwrap_or(config.default_rate);
     let classes = devices
         .iter()
-        .map(|device| classify_power(device, config))
+        .map(|device| classify_power(device, config, battery_trends))
         .collect::<Vec<_>>();
     let has_known_discharging = classes.contains(&PowerClass::Discharging);
 
@@ -190,7 +276,11 @@ fn apply_power_policy(
     Ok(())
 }
 
-fn classify_power(device: &DeviceSnapshot, config: &PollMonitorConfig) -> PowerClass {
+fn classify_power(
+    device: &DeviceSnapshot,
+    config: &PollMonitorConfig,
+    battery_trends: &BatteryTrendTracker,
+) -> PowerClass {
     if let Some(charging_like) = device
         .battery
         .and_then(|battery| battery.is_charging_like())
@@ -200,6 +290,19 @@ fn classify_power(device: &DeviceSnapshot, config: &PollMonitorConfig) -> PowerC
         } else {
             PowerClass::Discharging
         };
+    }
+
+    if device.battery.is_some()
+        && device
+            .battery
+            .is_some_and(|battery| battery.is_charging_like().is_none())
+    {
+        if device.battery.and_then(|battery| battery.level_percent) == Some(100) {
+            return PowerClass::Charging;
+        }
+        if let Some(class) = battery_trends.classify(device) {
+            return class;
+        }
     }
 
     match device.connection {
@@ -299,7 +402,10 @@ fn apply_snapshot_rate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AppRule;
+    use crate::{
+        config::AppRule,
+        devices::{BatteryStatus, ChargeState, GWOLVES_VENDOR_ID, IPI_VENDOR_ID, ProtocolKind},
+    };
 
     #[test]
     fn uses_active_rule_before_restore() {
@@ -425,5 +531,151 @@ mod tests {
             ),
             (PollingRate::Hz1000, "unknown-power idle")
         );
+    }
+
+    #[test]
+    fn battery_trend_marks_unknown_state_charging() {
+        let config = PollMonitorConfig {
+            battery_trend_window_ms: 600_000,
+            battery_trend_min_delta: 1,
+            assume_wireless_is_discharging: false,
+            ..PollMonitorConfig::default()
+        };
+        let now = Instant::now();
+        let mut tracker = BatteryTrendTracker::from_config(&config);
+        let mut device = test_device(
+            IPI_VENDOR_ID,
+            0x1014,
+            ProtocolKind::IpiPixV1 { report_id: 3 },
+            BatteryStatus::level_only(80),
+        );
+        tracker.record_at(&[device.clone()], now);
+        device.battery = Some(BatteryStatus::level_only(81));
+        tracker.record_at(&[device.clone()], now + Duration::from_secs(60));
+
+        assert_eq!(
+            classify_power(&device, &config, &tracker),
+            PowerClass::Charging
+        );
+    }
+
+    #[test]
+    fn explicit_charge_state_wins_over_battery_trend() {
+        let config = PollMonitorConfig {
+            battery_trend_window_ms: 600_000,
+            battery_trend_min_delta: 1,
+            ..PollMonitorConfig::default()
+        };
+        let now = Instant::now();
+        let mut tracker = BatteryTrendTracker::from_config(&config);
+        let mut device = test_device(
+            GWOLVES_VENDOR_ID,
+            0x3517,
+            ProtocolKind::Feature64 {
+                new_protocol: false,
+                wired_device_id: 2,
+            },
+            BatteryStatus::with_raw_state(75, ChargeState::Discharging, 0),
+        );
+        tracker.record_at(&[device.clone()], now);
+        device.battery = Some(BatteryStatus::with_raw_state(
+            76,
+            ChargeState::Discharging,
+            0,
+        ));
+        tracker.record_at(&[device.clone()], now + Duration::from_secs(60));
+
+        assert_eq!(
+            classify_power(&device, &config, &tracker),
+            PowerClass::Discharging
+        );
+    }
+
+    #[test]
+    fn flat_unknown_battery_stays_unknown() {
+        let config = PollMonitorConfig {
+            battery_trend_window_ms: 600_000,
+            battery_trend_min_delta: 1,
+            assume_wireless_is_discharging: false,
+            ..PollMonitorConfig::default()
+        };
+        let now = Instant::now();
+        let mut tracker = BatteryTrendTracker::from_config(&config);
+        let device = test_device(
+            IPI_VENDOR_ID,
+            0x1014,
+            ProtocolKind::IpiPixV1 { report_id: 3 },
+            BatteryStatus::level_only(80),
+        );
+        tracker.record_at(&[device.clone()], now);
+        tracker.record_at(&[device.clone()], now + Duration::from_secs(60));
+
+        assert_eq!(
+            classify_power(&device, &config, &tracker),
+            PowerClass::Unknown
+        );
+    }
+
+    #[test]
+    fn full_unknown_battery_is_treated_as_charging() {
+        let config = PollMonitorConfig {
+            assume_wireless_is_discharging: false,
+            ..PollMonitorConfig::default()
+        };
+        let tracker = BatteryTrendTracker::from_config(&config);
+        let device = test_device(
+            IPI_VENDOR_ID,
+            0x1014,
+            ProtocolKind::IpiPixV1 { report_id: 3 },
+            BatteryStatus::level_only(100),
+        );
+
+        assert_eq!(
+            classify_power(&device, &config, &tracker),
+            PowerClass::Charging
+        );
+    }
+
+    #[test]
+    fn explicit_discharging_wins_over_full_battery_assumption() {
+        let config = PollMonitorConfig::default();
+        let tracker = BatteryTrendTracker::from_config(&config);
+        let device = test_device(
+            GWOLVES_VENDOR_ID,
+            0x3517,
+            ProtocolKind::Feature64 {
+                new_protocol: false,
+                wired_device_id: 2,
+            },
+            BatteryStatus::with_raw_state(100, ChargeState::Discharging, 0),
+        );
+
+        assert_eq!(
+            classify_power(&device, &config, &tracker),
+            PowerClass::Discharging
+        );
+    }
+
+    fn test_device(
+        vid: u16,
+        pid: u16,
+        protocol: ProtocolKind,
+        battery: BatteryStatus,
+    ) -> DeviceSnapshot {
+        DeviceSnapshot {
+            path: format!("test-{vid:04x}-{pid:04x}"),
+            vid,
+            pid,
+            product_name: None,
+            vendor_name: "Test",
+            model_name: "Mouse",
+            connection: ConnectionKind::Wireless,
+            protocol,
+            supported_rates: vec![PollingRate::Hz1000, PollingRate::Hz4000],
+            current_rate: Some(PollingRate::Hz1000),
+            battery: Some(battery),
+            battery_error: None,
+            read_error: None,
+        }
     }
 }

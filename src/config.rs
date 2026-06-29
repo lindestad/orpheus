@@ -15,6 +15,8 @@ pub struct PollMonitorConfig {
     pub restore_rate: Option<PollingRate>,
     pub scan_interval_ms: u64,
     pub power_policy: PowerPolicy,
+    pub battery_trend_window_ms: u64,
+    pub battery_trend_min_delta: u8,
     pub assume_wired_is_charging: bool,
     pub assume_wireless_is_discharging: bool,
     pub allow_unknown_power_active: bool,
@@ -28,6 +30,8 @@ impl Default for PollMonitorConfig {
             restore_rate: Some(PollingRate::Hz8000),
             scan_interval_ms: 1_000,
             power_policy: PowerPolicy::FirstDevice,
+            battery_trend_window_ms: 600_000,
+            battery_trend_min_delta: 1,
             assume_wired_is_charging: false,
             assume_wireless_is_discharging: false,
             allow_unknown_power_active: true,
@@ -80,8 +84,10 @@ default_rate = 1000
 restore_rate = 1000
 scan_interval_ms = 1000
 power_policy = "active-non-charging"
+battery_trend_window_ms = 600000
+battery_trend_min_delta = 1
 assume_wired_is_charging = true
-assume_wireless_is_discharging = true
+assume_wireless_is_discharging = false
 allow_unknown_power_active = true
 
 [[rules]]
@@ -121,6 +127,8 @@ rate = 1000
         let config: PollMonitorConfig = toml::from_str(
             r#"
 power_policy = "active-non-charging"
+battery_trend_window_ms = 600000
+battery_trend_min_delta = 1
 assume_wired_is_charging = true
 assume_wireless_is_discharging = true
 
@@ -132,6 +140,8 @@ rate = "4k"
         .unwrap();
 
         assert_eq!(config.power_policy, PowerPolicy::ActiveNonCharging);
+        assert_eq!(config.battery_trend_window_ms, 600_000);
+        assert_eq!(config.battery_trend_min_delta, 1);
         assert!(config.assume_wired_is_charging);
         assert!(config.assume_wireless_is_discharging);
         assert_eq!(config.rules[0].rate, PollingRate::Hz4000);
