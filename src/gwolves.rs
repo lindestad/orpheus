@@ -276,6 +276,21 @@ impl ModelInfo {
             )
         }
     }
+
+    pub fn protocol_candidates(self) -> Vec<ProtocolKind> {
+        let mut protocols = vec![self.protocol];
+        if let ProtocolKind::Feature64 {
+            new_protocol: false,
+            wired_device_id,
+        } = self.protocol
+        {
+            protocols.push(ProtocolKind::Feature64 {
+                new_protocol: true,
+                wired_device_id,
+            });
+        }
+        protocols
+    }
 }
 
 pub const RATES_1K: &[PollingRate] = &[
@@ -528,6 +543,24 @@ mod tests {
             PollingRate::Hz8000,
         );
         assert_eq!(&report[2..8], &[2, 2, 1, 0, 1, 128]);
+    }
+
+    #[test]
+    fn old_feature64_models_also_probe_new_protocol() {
+        let (model, _) = find_model(GWOLVES_VENDOR_ID, 0x3517).unwrap();
+        assert_eq!(
+            model.protocol_candidates(),
+            vec![
+                ProtocolKind::Feature64 {
+                    new_protocol: false,
+                    wired_device_id: 2,
+                },
+                ProtocolKind::Feature64 {
+                    new_protocol: true,
+                    wired_device_id: 2,
+                },
+            ]
+        );
     }
 
     #[test]

@@ -53,8 +53,8 @@ cargo run -- watch --config poll-monitor.toml --dry-run --once
 
 - `q` / `Esc`: quit
 - `r`: refresh devices
-- `up` / `down`: select device
-- `left` / `right`: select target polling rate
+- `up` / `down` or `k` / `j`: select device
+- `left` / `right` or `h` / `l`: select target polling rate
 - `Enter`: apply selected rate
 - `Space`: sync target to current rate
 

@@ -56,16 +56,7 @@ impl HidPollMonitor {
                 continue;
             };
 
-            let current_rate = match info.open_device(&self.api) {
-                Ok(device) => {
-                    let live = GwolvesDevice::new(device, model, connection);
-                    match live.read_rate() {
-                        Ok(rate) => (Some(rate), None),
-                        Err(err) => (None, Some(err.to_string())),
-                    }
-                }
-                Err(err) => (None, Some(err.to_string())),
-            };
+            let probe = self.probe_info(info, model, connection);
 
             let snapshot = DeviceSnapshot {
                 path: info.path().to_string_lossy().into_owned(),
@@ -74,10 +65,10 @@ impl HidPollMonitor {
                 product_name: info.product_string().map(ToOwned::to_owned),
                 model_name: model.name,
                 connection,
-                protocol: model.protocol,
+                protocol: probe.protocol,
                 supported_rates: model.supported_rates(connection).to_vec(),
-                current_rate: current_rate.0,
-                read_error: current_rate.1,
+                current_rate: probe.current_rate,
+                read_error: probe.read_error,
             };
 
             merge_snapshot(&mut devices, snapshot);
@@ -92,10 +83,12 @@ impl HidPollMonitor {
             let Some((model, connection)) = find_model(vid, pid) else {
                 continue;
             };
-            if let Ok(device) = info.open_device(&self.api) {
-                let live = GwolvesDevice::new(device, model, connection);
-                if live.read_rate().is_ok() {
-                    return Ok(live);
+            for protocol in model.protocol_candidates() {
+                if let Ok(device) = info.open_device(&self.api) {
+                    let live = GwolvesDevice::new(device, model, connection, protocol);
+                    if live.read_rate().is_ok() {
+                        return Ok(live);
+                    }
                 }
             }
         }
@@ -113,13 +106,15 @@ impl HidPollMonitor {
             let Some((model, connection)) = find_model(vid, pid) else {
                 continue;
             };
-            let device = info
-                .open_device(&self.api)
-                .with_context(|| format!("failed to open {:04x}:{:04x}", vid, pid))?;
-            let live = GwolvesDevice::new(device, model, connection);
-            match live.read_rate() {
-                Ok(_) => return Ok(live),
-                Err(err) => last_error = Some(err.to_string()),
+            for protocol in model.protocol_candidates() {
+                let device = info
+                    .open_device(&self.api)
+                    .with_context(|| format!("failed to open {:04x}:{:04x}", vid, pid))?;
+                let live = GwolvesDevice::new(device, model, connection, protocol);
+                match live.read_rate() {
+                    Ok(_) => return Ok(live),
+                    Err(err) => last_error = Some(format!("{protocol}: {err}")),
+                }
             }
         }
         if let Some(error) = last_error {
@@ -136,6 +131,47 @@ impl HidPollMonitor {
             ))
         }
     }
+
+    fn probe_info(
+        &self,
+        info: &hidapi::DeviceInfo,
+        model: &'static ModelInfo,
+        connection: ConnectionKind,
+    ) -> DeviceProbe {
+        let mut errors = Vec::new();
+        for protocol in model.protocol_candidates() {
+            let device = match info.open_device(&self.api) {
+                Ok(device) => device,
+                Err(err) => {
+                    errors.push(format!("{protocol}: {err}"));
+                    continue;
+                }
+            };
+            let live = GwolvesDevice::new(device, model, connection, protocol);
+            match live.read_rate() {
+                Ok(rate) => {
+                    return DeviceProbe {
+                        protocol,
+                        current_rate: Some(rate),
+                        read_error: None,
+                    };
+                }
+                Err(err) => errors.push(format!("{protocol}: {err}")),
+            }
+        }
+
+        DeviceProbe {
+            protocol: model.protocol,
+            current_rate: None,
+            read_error: Some(errors.join("; ")),
+        }
+    }
+}
+
+struct DeviceProbe {
+    protocol: ProtocolKind,
+    current_rate: Option<PollingRate>,
+    read_error: Option<String>,
 }
 
 fn merge_snapshot(devices: &mut Vec<DeviceSnapshot>, snapshot: DeviceSnapshot) {
@@ -159,14 +195,21 @@ pub struct GwolvesDevice {
     device: HidDevice,
     model: &'static ModelInfo,
     connection: ConnectionKind,
+    protocol: ProtocolKind,
 }
 
 impl GwolvesDevice {
-    pub fn new(device: HidDevice, model: &'static ModelInfo, connection: ConnectionKind) -> Self {
+    pub fn new(
+        device: HidDevice,
+        model: &'static ModelInfo,
+        connection: ConnectionKind,
+        protocol: ProtocolKind,
+    ) -> Self {
         Self {
             device,
             model,
             connection,
+            protocol,
         }
     }
 
@@ -178,8 +221,12 @@ impl GwolvesDevice {
         self.connection
     }
 
+    pub fn protocol(&self) -> ProtocolKind {
+        self.protocol
+    }
+
     pub fn read_rate(&self) -> Result<PollingRate> {
-        match self.model.protocol {
+        match self.protocol {
             ProtocolKind::Feature64 { .. } => self.read_feature64_rate(),
             ProtocolKind::Eeprom16 => self.read_eeprom16_rate(),
         }
@@ -187,28 +234,26 @@ impl GwolvesDevice {
 
     pub fn set_rate(&self, rate: PollingRate) -> Result<()> {
         self.model.require_rate(self.connection, rate)?;
-        match self.model.protocol {
+        match self.protocol {
             ProtocolKind::Feature64 { .. } => self.set_feature64_rate(rate),
             ProtocolKind::Eeprom16 => self.set_eeprom16_rate(rate),
         }
     }
 
     fn read_feature64_rate(&self) -> Result<PollingRate> {
-        let report =
-            build_feature64_get_rate(self.model.protocol, self.connection, DEFAULT_PROFILE);
+        let report = build_feature64_get_rate(self.protocol, self.connection, DEFAULT_PROFILE);
         self.send_feature_payload(&report)?;
         thread::sleep(Duration::from_millis(20));
         let response = self.get_feature_payload()?;
         let code = self.extract_feature64_rate_code(&response)?;
-        self.model
-            .protocol
+        self.protocol
             .rate_from_code(code)
             .ok_or_else(|| anyhow!("device returned unknown polling-rate code {code}"))
     }
 
     fn set_feature64_rate(&self, rate: PollingRate) -> Result<()> {
         let report =
-            build_feature64_set_rate(self.model.protocol, self.connection, DEFAULT_PROFILE, rate);
+            build_feature64_set_rate(self.protocol, self.connection, DEFAULT_PROFILE, rate);
         self.send_feature_payload(&report)?;
         thread::sleep(Duration::from_millis(20));
         let _ = self.get_feature_payload();
@@ -220,8 +265,7 @@ impl GwolvesDevice {
         let code = *response
             .get(5)
             .ok_or_else(|| anyhow!("short report8 response while reading polling rate"))?;
-        self.model
-            .protocol
+        self.protocol
             .rate_from_code(code)
             .ok_or_else(|| anyhow!("device returned unknown polling-rate code {code}"))
     }
@@ -238,7 +282,7 @@ impl GwolvesDevice {
         } else {
             0
         };
-        match self.model.protocol {
+        match self.protocol {
             ProtocolKind::Feature64 {
                 new_protocol: true, ..
             } => response
