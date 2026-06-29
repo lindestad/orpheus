@@ -1,2 +1,16 @@
+# Rust build output
 /target/
+
+# Local runtime config. Keep poll-monitor.example.toml tracked.
+/poll-monitor.toml
+
+# Windows/debug artifacts
 *.pdb
+Thumbs.db
+Desktop.ini
+
+# Editor/project-local files
+/.vscode/
+/.idea/
+*.swp
+*.swo

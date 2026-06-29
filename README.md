@@ -1,23 +1,66 @@
 # poll-monitor
 
-A small Windows-focused G-Wolves Fenrir-family polling-rate monitor.
+A small Windows-focused G-Wolves Fenrir-family polling-rate monitor and switcher.
 
 The current app is a Rust CLI/TUI. It reads the mouse's configured polling rate through HID feature/input reports, can set a target rate, and can watch running processes to apply simple app-specific rate rules.
 
-## Commands
+## Status
+
+This is an early working prototype. It has been tested against a G-Wolves Fenrir receiver detected as `33e4:3517`, including reading the current rate and applying a safe no-op write from `1000 Hz` to `1000 Hz`.
+
+Supported model IDs currently cover known Fenrir, Fenrir Pro, and Fenir Max wired/receiver IDs from G-Wolves WebHID protocol data.
+
+## Usage
+
+Launch the TUI:
 
 ```powershell
 cargo run
-cargo run -- tui
+```
+
+List supported devices and current configured polling rates:
+
+```powershell
 cargo run -- list
+```
+
+Set the first supported device to a rate:
+
+```powershell
 cargo run -- set 1000
+cargo run -- set 8k
+```
+
+Create a local config file:
+
+```powershell
 cargo run -- init-config
+```
+
+Watch running processes and apply configured app rules:
+
+```powershell
 cargo run -- watch --config poll-monitor.toml
 ```
 
-Use `cargo run -- watch --config poll-monitor.toml --dry-run --once` to validate a config without writing to the mouse.
+Validate the watcher without writing to the mouse:
+
+```powershell
+cargo run -- watch --config poll-monitor.toml --dry-run --once
+```
+
+## TUI Controls
+
+- `q` / `Esc`: quit
+- `r`: refresh devices
+- `up` / `down`: select device
+- `left` / `right`: select target polling rate
+- `Enter`: apply selected rate
+- `Space`: sync target to current rate
 
 ## Config
+
+`poll-monitor.toml` is ignored by git so local app rules do not get committed. Use `poll-monitor.example.toml` as the tracked template.
 
 ```toml
 default_rate = 8000
@@ -32,8 +75,11 @@ restore = 8000
 
 Rules are checked in file order. The first matching process wins. Process names are matched case-insensitively with an optional `.exe` suffix.
 
-## Notes
+Rates can be written as numbers (`1000`, `8000`) or shorthand strings (`"1k"`, `"8k"`).
 
-- Supported model IDs are based on G-Wolves Fenrir/Fenrir Pro/Fenir Max WebHID protocol data.
+## Design Notes
+
 - The TUI and watcher query the configured polling rate through device control reports, not by sampling pointer movement.
+- The watcher scans processes at `scan_interval_ms`, with a minimum interval of 250 ms.
 - The watcher writes only when the desired rule target changes.
+- The long-term path is to keep this HID/control core and add a system tray UI around it later.
