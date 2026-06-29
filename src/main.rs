@@ -1,3 +1,88 @@
-fn main() {
-    println!("Hello, world!");
+use std::{str::FromStr, thread, time::Duration};
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use poll_monitor::{
+    gwolves::{PollingRate, format_supported_rates},
+    hid_device::HidPollMonitor,
+    tui::run_tui,
+};
+
+#[derive(Debug, Parser)]
+#[command(name = "poll-monitor")]
+#[command(about = "Monitor and switch G-Wolves Fenrir polling rates")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Launch the interactive terminal UI.
+    Tui,
+    /// List supported devices and their current configured rate.
+    List,
+    /// Set the first supported device to a polling rate, e.g. 1000 or 8k.
+    Set { rate: String },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command.unwrap_or(Command::Tui) {
+        Command::Tui => run_tui(),
+        Command::List => list_devices(),
+        Command::Set { rate } => set_rate(&rate),
+    }
+}
+
+fn list_devices() -> Result<()> {
+    let monitor = HidPollMonitor::new()?;
+    let devices = monitor.scan()?;
+    if devices.is_empty() {
+        println!("no supported G-Wolves Fenrir-family devices found");
+        return Ok(());
+    }
+
+    for device in devices {
+        let current = device
+            .current_rate
+            .map(|rate| rate.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!(
+            "{:04x}:{:04x} {:<18} {:<8} current: {:<8} supported: {}",
+            device.vid,
+            device.pid,
+            device.model_name,
+            device.connection,
+            current,
+            format_supported_rates(&device.supported_rates)
+        );
+        if let Some(error) = device.read_error {
+            println!("  read error: {error}");
+        }
+    }
+    Ok(())
+}
+
+fn set_rate(raw_rate: &str) -> Result<()> {
+    let rate = PollingRate::from_str(raw_rate)?;
+    let monitor = HidPollMonitor::new()?;
+    let device = monitor.open_first_supported()?;
+    let before = device.read_rate().ok();
+    device.set_rate(rate)?;
+    thread::sleep(Duration::from_millis(80));
+    let after = device.read_rate().ok();
+
+    println!(
+        "{} {}: {} -> {}",
+        device.model().name,
+        device.connection(),
+        before
+            .map(|rate| rate.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        after
+            .map(|rate| rate.to_string())
+            .unwrap_or_else(|| rate.to_string())
+    );
+    Ok(())
 }

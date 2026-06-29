@@ -67,7 +67,7 @@ impl HidPollMonitor {
                 Err(err) => (None, Some(err.to_string())),
             };
 
-            devices.push(DeviceSnapshot {
+            let snapshot = DeviceSnapshot {
                 path: info.path().to_string_lossy().into_owned(),
                 vid,
                 pid,
@@ -78,7 +78,9 @@ impl HidPollMonitor {
                 supported_rates: model.supported_rates(connection).to_vec(),
                 current_rate: current_rate.0,
                 read_error: current_rate.1,
-            });
+            };
+
+            merge_snapshot(&mut devices, snapshot);
         }
         Ok(devices)
     }
@@ -90,12 +92,66 @@ impl HidPollMonitor {
             let Some((model, connection)) = find_model(vid, pid) else {
                 continue;
             };
+            if let Ok(device) = info.open_device(&self.api) {
+                let live = GwolvesDevice::new(device, model, connection);
+                if live.read_rate().is_ok() {
+                    return Ok(live);
+                }
+            }
+        }
+        Err(anyhow!("no supported G-Wolves Fenrir-family device found"))
+    }
+
+    pub fn open_by_vid_pid(&self, target_vid: u16, target_pid: u16) -> Result<GwolvesDevice> {
+        let mut last_error = None;
+        for info in self.api.device_list() {
+            let vid = info.vendor_id();
+            let pid = info.product_id();
+            if vid != target_vid || pid != target_pid {
+                continue;
+            }
+            let Some((model, connection)) = find_model(vid, pid) else {
+                continue;
+            };
             let device = info
                 .open_device(&self.api)
                 .with_context(|| format!("failed to open {:04x}:{:04x}", vid, pid))?;
-            return Ok(GwolvesDevice::new(device, model, connection));
+            let live = GwolvesDevice::new(device, model, connection);
+            match live.read_rate() {
+                Ok(_) => return Ok(live),
+                Err(err) => last_error = Some(err.to_string()),
+            }
         }
-        Err(anyhow!("no supported G-Wolves Fenrir-family device found"))
+        if let Some(error) = last_error {
+            Err(anyhow!(
+                "found {:04x}:{:04x}, but no interface answered: {error}",
+                target_vid,
+                target_pid
+            ))
+        } else {
+            Err(anyhow!(
+                "no supported device found for {:04x}:{:04x}",
+                target_vid,
+                target_pid
+            ))
+        }
+    }
+}
+
+fn merge_snapshot(devices: &mut Vec<DeviceSnapshot>, snapshot: DeviceSnapshot) {
+    let Some(existing) = devices.iter_mut().find(|device| {
+        device.vid == snapshot.vid
+            && device.pid == snapshot.pid
+            && device.connection == snapshot.connection
+    }) else {
+        devices.push(snapshot);
+        return;
+    };
+
+    if existing.current_rate.is_none() && snapshot.current_rate.is_some() {
+        *existing = snapshot;
+    } else if existing.current_rate.is_none() && existing.read_error.is_none() {
+        existing.read_error = snapshot.read_error;
     }
 }
 
