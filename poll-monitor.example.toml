@@ -1,0 +1,9 @@
+# poll-monitor config
+default_rate = 8000
+restore_rate = 8000
+scan_interval_ms = 1000
+
+[[rules]]
+exe = "problem-game.exe"
+rate = 1000
+restore = 8000

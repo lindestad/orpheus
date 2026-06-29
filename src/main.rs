@@ -1,11 +1,13 @@
-use std::{str::FromStr, thread, time::Duration};
+use std::{path::PathBuf, str::FromStr, thread, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use poll_monitor::{
+    config::{PollMonitorConfig, default_config_path},
     gwolves::{PollingRate, format_supported_rates},
     hid_device::HidPollMonitor,
     tui::run_tui,
+    watcher::run_watch,
 };
 
 #[derive(Debug, Parser)]
@@ -24,6 +26,20 @@ enum Command {
     List,
     /// Set the first supported device to a polling rate, e.g. 1000 or 8k.
     Set { rate: String },
+    /// Write an example app-rule config file.
+    InitConfig {
+        #[arg(default_value = "poll-monitor.toml")]
+        path: PathBuf,
+    },
+    /// Watch running processes and apply configured app rules.
+    Watch {
+        #[arg(short, long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        once: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -32,6 +48,12 @@ fn main() -> Result<()> {
         Command::Tui => run_tui(),
         Command::List => list_devices(),
         Command::Set { rate } => set_rate(&rate),
+        Command::InitConfig { path } => init_config(path),
+        Command::Watch {
+            config,
+            dry_run,
+            once,
+        } => watch(config.unwrap_or_else(default_config_path), dry_run, once),
     }
 }
 
@@ -85,4 +107,21 @@ fn set_rate(raw_rate: &str) -> Result<()> {
             .unwrap_or_else(|| rate.to_string())
     );
     Ok(())
+}
+
+fn init_config(path: PathBuf) -> Result<()> {
+    PollMonitorConfig::write_example(&path)?;
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+fn watch(path: PathBuf, dry_run: bool, once: bool) -> Result<()> {
+    let config = PollMonitorConfig::load(&path)?;
+    println!(
+        "watching {} rule(s) from {} every {} ms",
+        config.rules.len(),
+        path.display(),
+        config.scan_interval_ms.max(250)
+    );
+    run_watch(config, dry_run, once)
 }

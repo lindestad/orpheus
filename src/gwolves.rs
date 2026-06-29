@@ -1,11 +1,14 @@
 use std::{fmt, str::FromStr};
 
 use anyhow::{Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{Error as DeError, Visitor},
+};
 
 pub const GWOLVES_VENDOR_ID: u16 = 0x33E4;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum PollingRate {
     Hz125,
     Hz250,
@@ -83,6 +86,60 @@ impl PollingRate {
 impl fmt::Display for PollingRate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} Hz", self.hz())
+    }
+}
+
+impl Serialize for PollingRate {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u16(self.hz())
+    }
+}
+
+impl<'de> Deserialize<'de> for PollingRate {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PollingRateVisitor;
+
+        impl<'de> Visitor<'de> for PollingRateVisitor {
+            type Value = PollingRate;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a polling rate like 1000, \"1000\", or \"8k\"")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                let value = u16::try_from(value)
+                    .map_err(|_| E::custom(format!("polling rate is too large: {value}")))?;
+                PollingRate::from_str(&value.to_string()).map_err(E::custom)
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                if value < 0 {
+                    return Err(E::custom(format!("polling rate must be positive: {value}")));
+                }
+                self.visit_u64(value as u64)
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: DeError,
+            {
+                PollingRate::from_str(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(PollingRateVisitor)
     }
 }
 
