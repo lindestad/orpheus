@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 
 use crate::{
     config::PollMonitorConfig,
-    gwolves::PollingRate,
+    devices::PollingRate,
     hid_device::HidPollMonitor,
     process_rules::{ActiveRule, ProcessScanner},
 };

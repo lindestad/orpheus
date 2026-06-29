@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use poll_monitor::{
     config::{PollMonitorConfig, default_config_path},
-    gwolves::{PollingRate, format_supported_rates},
+    devices::{PollingRate, format_supported_rates},
     hid_device::HidPollMonitor,
     tui::run_tui,
     watcher::run_watch,
@@ -12,7 +12,7 @@ use poll_monitor::{
 
 #[derive(Debug, Parser)]
 #[command(name = "poll-monitor")]
-#[command(about = "Monitor and switch G-Wolves Fenrir polling rates")]
+#[command(about = "Monitor and switch mouse polling rates")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -61,7 +61,7 @@ fn list_devices() -> Result<()> {
     let monitor = HidPollMonitor::new()?;
     let devices = monitor.scan()?;
     if devices.is_empty() {
-        println!("no supported G-Wolves Fenrir-family devices found");
+        println!("no supported polling-rate devices found");
         return Ok(());
     }
 
@@ -71,9 +71,10 @@ fn list_devices() -> Result<()> {
             .map(|rate| rate.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         println!(
-            "{:04x}:{:04x} {:<18} {:<8} current: {:<8} supported: {}",
+            "{:04x}:{:04x} {:<9} {:<18} {:<8} current: {:<8} supported: {}",
             device.vid,
             device.pid,
+            device.vendor_name,
             device.model_name,
             device.connection,
             current,

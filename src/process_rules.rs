@@ -1,6 +1,6 @@
 use sysinfo::{ProcessesToUpdate, System};
 
-use crate::{config::AppRule, gwolves::PollingRate};
+use crate::{config::AppRule, devices::PollingRate};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveRule {

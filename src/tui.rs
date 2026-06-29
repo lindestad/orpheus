@@ -19,7 +19,7 @@ use ratatui::{
 };
 
 use crate::{
-    gwolves::PollingRate,
+    devices::PollingRate,
     hid_device::{DeviceSnapshot, HidPollMonitor},
 };
 
@@ -279,7 +279,7 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if app.devices.is_empty() {
         frame.render_widget(Clear, area);
         frame.render_widget(
-            Paragraph::new("No supported G-Wolves Fenrir-family device is visible.")
+            Paragraph::new("No supported polling-rate device is visible.")
                 .wrap(Wrap { trim: true })
                 .block(Block::default().title("Devices").borders(Borders::ALL)),
             area,
@@ -309,7 +309,8 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         };
 
         Row::new([
-            Cell::from(format!("{} {}", idx + 1, device.model_name)),
+            Cell::from(format!("{} {}", idx + 1, device.vendor_name)),
+            Cell::from(device.model_name),
             Cell::from(format!("{:04x}:{:04x}", device.vid, device.pid)),
             Cell::from(device.connection.to_string()),
             Cell::from(device.protocol.to_string()),
@@ -323,7 +324,8 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(18),
+            Constraint::Length(13),
+            Constraint::Length(14),
             Constraint::Length(11),
             Constraint::Length(10),
             Constraint::Length(15),
@@ -335,6 +337,7 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     .header(
         Row::new([
             "Device",
+            "Model",
             "VID:PID",
             "Mode",
             "Protocol",

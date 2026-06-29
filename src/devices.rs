@@ -7,6 +7,7 @@ use serde::{
 };
 
 pub const GWOLVES_VENDOR_ID: u16 = 0x33E4;
+pub const IPI_VENDOR_ID: u16 = 0x372E;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum PollingRate {
@@ -78,6 +79,31 @@ impl PollingRate {
             16 => Some(Self::Hz2000),
             32 => Some(Self::Hz4000),
             64 => Some(Self::Hz8000),
+            _ => None,
+        }
+    }
+
+    pub const fn ipi_pix_v1_code(self) -> u8 {
+        match self {
+            Self::Hz1000 => 0,
+            Self::Hz500 => 1,
+            Self::Hz250 => 2,
+            Self::Hz125 => 3,
+            Self::Hz8000 => 4,
+            Self::Hz4000 => 5,
+            Self::Hz2000 => 6,
+        }
+    }
+
+    pub fn from_ipi_pix_v1_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Hz1000),
+            1 => Some(Self::Hz500),
+            2 => Some(Self::Hz250),
+            3 => Some(Self::Hz125),
+            4 => Some(Self::Hz8000),
+            5 => Some(Self::Hz4000),
+            6 => Some(Self::Hz2000),
             _ => None,
         }
     }
@@ -169,6 +195,9 @@ pub enum ProtocolKind {
         wired_device_id: u8,
     },
     Eeprom16,
+    IpiPixV1 {
+        report_id: u8,
+    },
 }
 
 impl ProtocolKind {
@@ -176,6 +205,7 @@ impl ProtocolKind {
         match self {
             Self::Feature64 { .. } => rate.feature64_code(),
             Self::Eeprom16 => rate.eeprom16_code(),
+            Self::IpiPixV1 { .. } => rate.ipi_pix_v1_code(),
         }
     }
 
@@ -183,6 +213,7 @@ impl ProtocolKind {
         match self {
             Self::Feature64 { .. } => PollingRate::from_feature64_code(code),
             Self::Eeprom16 => PollingRate::from_eeprom16_code(code),
+            Self::IpiPixV1 { .. } => PollingRate::from_ipi_pix_v1_code(code),
         }
     }
 }
@@ -198,6 +229,7 @@ impl fmt::Display for ProtocolKind {
                 ..
             } => write!(f, "feature64 old"),
             Self::Eeprom16 => write!(f, "report8 eeprom"),
+            Self::IpiPixV1 { .. } => write!(f, "ipi pix v1"),
         }
     }
 }
@@ -227,6 +259,7 @@ impl fmt::Display for ConnectionKind {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelInfo {
+    pub vendor_name: &'static str,
     pub name: &'static str,
     pub vid: u16,
     pub wired_pid: Option<u16>,
@@ -320,6 +353,7 @@ pub const RATES_8K: &[PollingRate] = &[
 
 pub const FENRIR_MODELS: &[ModelInfo] = &[
     ModelInfo {
+        vendor_name: "G-Wolves",
         name: "Fenrir Pro",
         vid: GWOLVES_VENDOR_ID,
         wired_pid: Some(0x3608),
@@ -335,6 +369,7 @@ pub const FENRIR_MODELS: &[ModelInfo] = &[
         receiver_rates: RATES_8K,
     },
     ModelInfo {
+        vendor_name: "G-Wolves",
         name: "Fenrir Pro",
         vid: GWOLVES_VENDOR_ID,
         wired_pid: Some(0x3619),
@@ -347,6 +382,7 @@ pub const FENRIR_MODELS: &[ModelInfo] = &[
         receiver_rates: RATES_8K,
     },
     ModelInfo {
+        vendor_name: "G-Wolves",
         name: "Fenrir",
         vid: GWOLVES_VENDOR_ID,
         wired_pid: Some(0x3508),
@@ -362,6 +398,7 @@ pub const FENRIR_MODELS: &[ModelInfo] = &[
         receiver_rates: RATES_8K,
     },
     ModelInfo {
+        vendor_name: "G-Wolves",
         name: "Fenir Max",
         vid: GWOLVES_VENDOR_ID,
         wired_pid: Some(0x3708),
@@ -378,12 +415,70 @@ pub const FENRIR_MODELS: &[ModelInfo] = &[
     },
 ];
 
+pub const IPI_PIAO_MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        vendor_name: "IPI",
+        name: "Piao",
+        vid: IPI_VENDOR_ID,
+        wired_pid: Some(0x1015),
+        wireless_pid: None,
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::IpiPixV1 { report_id: 3 },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "IPI",
+        name: "Piao",
+        vid: IPI_VENDOR_ID,
+        wired_pid: Some(0x1028),
+        wireless_pid: None,
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::IpiPixV1 { report_id: 3 },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "IPI",
+        name: "Piao",
+        vid: IPI_VENDOR_ID,
+        wired_pid: Some(0x1056),
+        wireless_pid: None,
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::IpiPixV1 { report_id: 3 },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "IPI",
+        name: "Piao",
+        vid: IPI_VENDOR_ID,
+        wired_pid: None,
+        wireless_pid: Some(0x1014),
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::IpiPixV1 { report_id: 3 },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+];
+
 pub fn find_model(vid: u16, pid: u16) -> Option<(&'static ModelInfo, ConnectionKind)> {
-    FENRIR_MODELS.iter().find_map(|model| {
-        model
-            .match_connection(vid, pid)
-            .map(|connection| (model, connection))
-    })
+    FENRIR_MODELS
+        .iter()
+        .chain(IPI_PIAO_MODELS)
+        .find_map(|model| {
+            model
+                .match_connection(vid, pid)
+                .map(|connection| (model, connection))
+        })
 }
 
 pub fn format_supported_rates(rates: &[PollingRate]) -> String {
@@ -422,6 +517,7 @@ pub fn build_feature64_get_rate(
             }
         }
         ProtocolKind::Eeprom16 => {}
+        ProtocolKind::IpiPixV1 { .. } => {}
     }
     report
 }
@@ -458,6 +554,7 @@ pub fn build_feature64_set_rate(
             report[4] = code;
         }
         ProtocolKind::Eeprom16 => {}
+        ProtocolKind::IpiPixV1 { .. } => {}
     }
     report
 }
@@ -483,6 +580,45 @@ pub fn build_eeprom16_set_rate(rate: PollingRate) -> [u8; 16] {
     report[5] = code;
     report[6] = 85u8.wrapping_sub(code);
     report
+}
+
+pub fn build_ipi_pix_v1_get_rate() -> [u8; 63] {
+    let mut report = [0; 63];
+    report[0..6].copy_from_slice(&[0, 80, 0, 10, 79, 64]);
+    write_ipi_checksum(&mut report);
+    report
+}
+
+pub fn build_ipi_pix_v1_set_rate(connection: ConnectionKind, rate: PollingRate) -> [u8; 63] {
+    let mut report = [0; 63];
+    let code = rate.ipi_pix_v1_code();
+    let encoded = if connection == ConnectionKind::Wireless && code >= 4 {
+        code
+    } else {
+        code << 4 | code
+    };
+    report[0..7].copy_from_slice(&[0, 80, 1, 49, 53, 1, encoded]);
+    write_ipi_checksum(&mut report);
+    report
+}
+
+pub fn ipi_pix_v1_rate_from_sensor_byte(
+    connection: ConnectionKind,
+    raw: u8,
+) -> Option<PollingRate> {
+    let code = if connection == ConnectionKind::Wireless {
+        raw & 0x07
+    } else {
+        (raw & 0x70) >> 4
+    };
+    PollingRate::from_ipi_pix_v1_code(code)
+}
+
+pub fn write_ipi_checksum(payload: &mut [u8]) {
+    payload[0] = payload
+        .iter()
+        .skip(1)
+        .fold(0u8, |checksum, byte| checksum.wrapping_add(*byte));
 }
 
 #[cfg(test)]
@@ -521,6 +657,16 @@ mod tests {
     }
 
     #[test]
+    fn maps_ipi_pix_v1_rate_codes() {
+        assert_eq!(PollingRate::Hz1000.ipi_pix_v1_code(), 0);
+        assert_eq!(PollingRate::Hz8000.ipi_pix_v1_code(), 4);
+        assert_eq!(
+            PollingRate::from_ipi_pix_v1_code(6),
+            Some(PollingRate::Hz2000)
+        );
+    }
+
+    #[test]
     fn finds_fenrir_models() {
         let (model, connection) = find_model(GWOLVES_VENDOR_ID, 0x3854).unwrap();
         assert_eq!(model.name, "Fenrir Pro");
@@ -529,6 +675,14 @@ mod tests {
         let (model, connection) = find_model(GWOLVES_VENDOR_ID, 0x3508).unwrap();
         assert_eq!(model.name, "Fenrir");
         assert_eq!(connection, ConnectionKind::Wired);
+    }
+
+    #[test]
+    fn finds_ipi_piao_models() {
+        let (model, connection) = find_model(IPI_VENDOR_ID, 0x1014).unwrap();
+        assert_eq!(model.vendor_name, "IPI");
+        assert_eq!(model.name, "Piao");
+        assert_eq!(connection, ConnectionKind::Wireless);
     }
 
     #[test]
@@ -567,5 +721,29 @@ mod tests {
     fn builds_eeprom16_rate_reports() {
         let report = build_eeprom16_set_rate(PollingRate::Hz8000);
         assert_eq!(&report[0..7], &[7, 0, 0, 0, 2, 64, 21]);
+    }
+
+    #[test]
+    fn builds_ipi_pix_v1_rate_reports() {
+        let get_report = build_ipi_pix_v1_get_rate();
+        assert_eq!(&get_report[0..6], &[233, 80, 0, 10, 79, 64]);
+
+        let set_wired = build_ipi_pix_v1_set_rate(ConnectionKind::Wired, PollingRate::Hz8000);
+        assert_eq!(&set_wired[0..7], &[252, 80, 1, 49, 53, 1, 68]);
+
+        let set_wireless = build_ipi_pix_v1_set_rate(ConnectionKind::Wireless, PollingRate::Hz8000);
+        assert_eq!(&set_wireless[0..7], &[188, 80, 1, 49, 53, 1, 4]);
+    }
+
+    #[test]
+    fn parses_ipi_pix_v1_sensor_rate_byte() {
+        assert_eq!(
+            ipi_pix_v1_rate_from_sensor_byte(ConnectionKind::Wired, 0x40),
+            Some(PollingRate::Hz8000)
+        );
+        assert_eq!(
+            ipi_pix_v1_rate_from_sensor_byte(ConnectionKind::Wireless, 4),
+            Some(PollingRate::Hz8000)
+        );
     }
 }

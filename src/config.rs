@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::gwolves::PollingRate;
+use crate::devices::PollingRate;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]

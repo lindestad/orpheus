@@ -1,14 +1,17 @@
 # poll-monitor
 
-A small Windows-focused G-Wolves Fenrir-family polling-rate monitor and switcher.
+A small Windows-focused mouse polling-rate monitor and switcher.
 
 The current app is a Rust CLI/TUI. It reads the mouse's configured polling rate through HID feature/input reports, can set a target rate, and can watch running processes to apply simple app-specific rate rules.
 
 ## Status
 
-This is an early working prototype. It has been tested against a G-Wolves Fenrir receiver detected as `33e4:3517`, including reading the current rate and applying a safe no-op write from `1000 Hz` to `1000 Hz`.
+This is an early working prototype. It has been tested against:
 
-Supported model IDs currently cover known Fenrir, Fenrir Pro, and Fenir Max wired/receiver IDs from G-Wolves WebHID protocol data.
+- G-Wolves Fenrir receiver `33e4:3517`, including read and no-op write.
+- IPI Piao wireless receiver `372e:1014`, including read and no-op write.
+
+Supported model IDs currently cover known Fenrir, Fenrir Pro, and Fenir Max wired/receiver IDs from G-Wolves WebHID protocol data, plus IPI Piao/Float-style PIX v1 mouse IDs from `https://shan.ipigame.cn/devices`.
 
 ## Usage
 
@@ -30,6 +33,8 @@ Set the first supported device to a rate:
 cargo run -- set 1000
 cargo run -- set 8k
 ```
+
+When multiple supported devices are connected, use the TUI to choose a specific device before applying a rate.
 
 Create a local config file:
 
@@ -80,6 +85,7 @@ Rates can be written as numbers (`1000`, `8000`) or shorthand strings (`"1k"`, `
 ## Design Notes
 
 - The TUI and watcher query the configured polling rate through device control reports, not by sampling pointer movement.
+- Device support is implemented as per-vendor protocol adapters under one HID monitor path.
 - The watcher scans processes at `scan_interval_ms`, with a minimum interval of 250 ms.
 - The watcher writes only when the desired rule target changes.
 - The long-term path is to keep this HID/control core and add a system tray UI around it later.

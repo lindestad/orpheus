@@ -3,19 +3,20 @@ use std::{thread, time::Duration};
 use anyhow::{Context, Result, anyhow};
 use hidapi::{HidApi, HidDevice};
 
-use crate::gwolves::{
+use crate::devices::{
     ConnectionKind, ModelInfo, PollingRate, ProtocolKind, build_eeprom16_get_rate,
-    build_eeprom16_set_rate, build_feature64_get_rate, build_feature64_set_rate, find_model,
-    format_supported_rates,
+    build_eeprom16_set_rate, build_feature64_get_rate, build_feature64_set_rate,
+    build_ipi_pix_v1_get_rate, build_ipi_pix_v1_set_rate, find_model, format_supported_rates,
+    ipi_pix_v1_rate_from_sensor_byte,
 };
 
 const DEFAULT_PROFILE: u8 = 1;
 const FEATURE_REPORT_ID: u8 = 0;
 const REPORT8_ID: u8 = 8;
 const FEATURE_PAYLOAD_LEN: usize = 64;
-const FEATURE_BUFFER_LEN: usize = FEATURE_PAYLOAD_LEN + 1;
 const REPORT8_PAYLOAD_LEN: usize = 16;
 const REPORT8_BUFFER_LEN: usize = REPORT8_PAYLOAD_LEN + 1;
+const IPI_PIX_PAYLOAD_LEN: usize = 63;
 
 #[derive(Clone, Debug)]
 pub struct DeviceSnapshot {
@@ -23,6 +24,7 @@ pub struct DeviceSnapshot {
     pub vid: u16,
     pub pid: u16,
     pub product_name: Option<String>,
+    pub vendor_name: &'static str,
     pub model_name: &'static str,
     pub connection: ConnectionKind,
     pub protocol: ProtocolKind,
@@ -63,6 +65,7 @@ impl HidPollMonitor {
                 vid,
                 pid,
                 product_name: info.product_string().map(ToOwned::to_owned),
+                vendor_name: model.vendor_name,
                 model_name: model.name,
                 connection,
                 protocol: probe.protocol,
@@ -76,7 +79,7 @@ impl HidPollMonitor {
         Ok(devices)
     }
 
-    pub fn open_first_supported(&self) -> Result<GwolvesDevice> {
+    pub fn open_first_supported(&self) -> Result<PollingDevice> {
         for info in self.api.device_list() {
             let vid = info.vendor_id();
             let pid = info.product_id();
@@ -85,17 +88,17 @@ impl HidPollMonitor {
             };
             for protocol in model.protocol_candidates() {
                 if let Ok(device) = info.open_device(&self.api) {
-                    let live = GwolvesDevice::new(device, model, connection, protocol);
+                    let live = PollingDevice::new(device, model, connection, protocol);
                     if live.read_rate().is_ok() {
                         return Ok(live);
                     }
                 }
             }
         }
-        Err(anyhow!("no supported G-Wolves Fenrir-family device found"))
+        Err(anyhow!("no supported polling-rate device found"))
     }
 
-    pub fn open_by_vid_pid(&self, target_vid: u16, target_pid: u16) -> Result<GwolvesDevice> {
+    pub fn open_by_vid_pid(&self, target_vid: u16, target_pid: u16) -> Result<PollingDevice> {
         let mut last_error = None;
         for info in self.api.device_list() {
             let vid = info.vendor_id();
@@ -110,7 +113,7 @@ impl HidPollMonitor {
                 let device = info
                     .open_device(&self.api)
                     .with_context(|| format!("failed to open {:04x}:{:04x}", vid, pid))?;
-                let live = GwolvesDevice::new(device, model, connection, protocol);
+                let live = PollingDevice::new(device, model, connection, protocol);
                 match live.read_rate() {
                     Ok(_) => return Ok(live),
                     Err(err) => last_error = Some(format!("{protocol}: {err}")),
@@ -147,7 +150,7 @@ impl HidPollMonitor {
                     continue;
                 }
             };
-            let live = GwolvesDevice::new(device, model, connection, protocol);
+            let live = PollingDevice::new(device, model, connection, protocol);
             match live.read_rate() {
                 Ok(rate) => {
                     return DeviceProbe {
@@ -191,14 +194,14 @@ fn merge_snapshot(devices: &mut Vec<DeviceSnapshot>, snapshot: DeviceSnapshot) {
     }
 }
 
-pub struct GwolvesDevice {
+pub struct PollingDevice {
     device: HidDevice,
     model: &'static ModelInfo,
     connection: ConnectionKind,
     protocol: ProtocolKind,
 }
 
-impl GwolvesDevice {
+impl PollingDevice {
     pub fn new(
         device: HidDevice,
         model: &'static ModelInfo,
@@ -229,6 +232,7 @@ impl GwolvesDevice {
         match self.protocol {
             ProtocolKind::Feature64 { .. } => self.read_feature64_rate(),
             ProtocolKind::Eeprom16 => self.read_eeprom16_rate(),
+            ProtocolKind::IpiPixV1 { .. } => self.read_ipi_pix_v1_rate(),
         }
     }
 
@@ -237,14 +241,15 @@ impl GwolvesDevice {
         match self.protocol {
             ProtocolKind::Feature64 { .. } => self.set_feature64_rate(rate),
             ProtocolKind::Eeprom16 => self.set_eeprom16_rate(rate),
+            ProtocolKind::IpiPixV1 { .. } => self.set_ipi_pix_v1_rate(rate),
         }
     }
 
     fn read_feature64_rate(&self) -> Result<PollingRate> {
         let report = build_feature64_get_rate(self.protocol, self.connection, DEFAULT_PROFILE);
-        self.send_feature_payload(&report)?;
+        self.send_feature_payload(FEATURE_REPORT_ID, &report)?;
         thread::sleep(Duration::from_millis(20));
-        let response = self.get_feature_payload()?;
+        let response = self.get_feature_payload(FEATURE_REPORT_ID, FEATURE_PAYLOAD_LEN)?;
         let code = self.extract_feature64_rate_code(&response)?;
         self.protocol
             .rate_from_code(code)
@@ -254,9 +259,9 @@ impl GwolvesDevice {
     fn set_feature64_rate(&self, rate: PollingRate) -> Result<()> {
         let report =
             build_feature64_set_rate(self.protocol, self.connection, DEFAULT_PROFILE, rate);
-        self.send_feature_payload(&report)?;
+        self.send_feature_payload(FEATURE_REPORT_ID, &report)?;
         thread::sleep(Duration::from_millis(20));
-        let _ = self.get_feature_payload();
+        let _ = self.get_feature_payload(FEATURE_REPORT_ID, FEATURE_PAYLOAD_LEN);
         Ok(())
     }
 
@@ -273,6 +278,33 @@ impl GwolvesDevice {
     fn set_eeprom16_rate(&self, rate: PollingRate) -> Result<()> {
         let report = build_eeprom16_set_rate(rate);
         let _ = self.transact_report8(report, 7, 50, 5)?;
+        Ok(())
+    }
+
+    fn read_ipi_pix_v1_rate(&self) -> Result<PollingRate> {
+        let ProtocolKind::IpiPixV1 { report_id } = self.protocol else {
+            unreachable!("ipi reader called for non-ipi protocol")
+        };
+        let report = build_ipi_pix_v1_get_rate();
+        self.send_feature_payload(report_id, &report)?;
+        thread::sleep(Duration::from_millis(50));
+        let response = self.get_ipi_pix_v1_response(report_id, &report)?;
+        let raw = response
+            .get(6)
+            .copied()
+            .ok_or_else(|| anyhow!("short ipi pix v1 response while reading polling rate"))?;
+        ipi_pix_v1_rate_from_sensor_byte(self.connection, raw)
+            .ok_or_else(|| anyhow!("device returned unknown ipi pix v1 polling-rate byte {raw}"))
+    }
+
+    fn set_ipi_pix_v1_rate(&self, rate: PollingRate) -> Result<()> {
+        let ProtocolKind::IpiPixV1 { report_id } = self.protocol else {
+            unreachable!("ipi writer called for non-ipi protocol")
+        };
+        let report = build_ipi_pix_v1_set_rate(self.connection, rate);
+        self.send_feature_payload(report_id, &report)?;
+        thread::sleep(Duration::from_millis(60));
+        let _ = self.get_ipi_pix_v1_response(report_id, &report);
         Ok(())
     }
 
@@ -302,27 +334,52 @@ impl GwolvesDevice {
                 }
                 Ok(code)
             }
-            ProtocolKind::Eeprom16 => unreachable!("feature64 parser called for eeprom protocol"),
+            ProtocolKind::Eeprom16 | ProtocolKind::IpiPixV1 { .. } => {
+                unreachable!("feature64 parser called for non-feature64 protocol")
+            }
         }
     }
 
-    fn send_feature_payload(&self, payload: &[u8; FEATURE_PAYLOAD_LEN]) -> Result<()> {
-        let mut buffer = [0; FEATURE_BUFFER_LEN];
-        buffer[0] = FEATURE_REPORT_ID;
-        buffer[1..].copy_from_slice(payload);
+    fn send_feature_payload(&self, report_id: u8, payload: &[u8]) -> Result<()> {
+        let mut buffer = Vec::with_capacity(payload.len() + 1);
+        buffer.push(report_id);
+        buffer.extend_from_slice(payload);
         self.device
             .send_feature_report(&buffer)
             .context("failed to send feature report")
     }
 
-    fn get_feature_payload(&self) -> Result<Vec<u8>> {
-        let mut buffer = [0; FEATURE_BUFFER_LEN];
-        buffer[0] = FEATURE_REPORT_ID;
+    fn get_feature_payload(&self, report_id: u8, payload_len: usize) -> Result<Vec<u8>> {
+        let mut buffer = vec![0; payload_len + 1];
+        buffer[0] = report_id;
         let len = self
             .device
             .get_feature_report(&mut buffer)
             .context("failed to receive feature report")?;
-        Ok(normalize_feature_payload(&buffer[..len]))
+        Ok(normalize_feature_payload(
+            &buffer[..len],
+            report_id,
+            payload_len,
+        ))
+    }
+
+    fn get_ipi_pix_v1_response(
+        &self,
+        report_id: u8,
+        request: &[u8; IPI_PIX_PAYLOAD_LEN],
+    ) -> Result<Vec<u8>> {
+        for _ in 0..4 {
+            let response = self.get_feature_payload(report_id, IPI_PIX_PAYLOAD_LEN)?;
+            let response = normalize_ipi_pix_v1_payload(&response);
+            if response.get(3) == request.get(3) && response.len() > 6 {
+                return Ok(response);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        Err(anyhow!(
+            "timed out waiting for ipi pix v1 command {}",
+            request[3]
+        ))
     }
 
     fn transact_report8(
@@ -371,12 +428,16 @@ impl GwolvesDevice {
     }
 }
 
-pub fn normalize_feature_payload(raw: &[u8]) -> Vec<u8> {
-    if raw.len() == FEATURE_BUFFER_LEN && raw[0] == FEATURE_REPORT_ID {
+pub fn normalize_feature_payload(raw: &[u8], report_id: u8, payload_len: usize) -> Vec<u8> {
+    if raw.len() == payload_len + 1 && raw[0] == report_id {
         raw[1..].to_vec()
     } else {
         raw.to_vec()
     }
+}
+
+pub fn normalize_ipi_pix_v1_payload(raw: &[u8]) -> Vec<u8> {
+    raw.get(1..).map(ToOwned::to_owned).unwrap_or_default()
 }
 
 pub fn normalize_report8_payload(raw: &[u8]) -> Vec<u8> {
@@ -405,13 +466,19 @@ mod tests {
 
     #[test]
     fn strips_native_feature_report_id() {
-        let mut raw = vec![0; FEATURE_BUFFER_LEN];
+        let mut raw = vec![0; FEATURE_PAYLOAD_LEN + 1];
         raw[1] = 0xA1;
         raw[9] = 1;
-        let payload = normalize_feature_payload(&raw);
+        let payload = normalize_feature_payload(&raw, FEATURE_REPORT_ID, FEATURE_PAYLOAD_LEN);
         assert_eq!(payload.len(), FEATURE_PAYLOAD_LEN);
         assert_eq!(payload[0], 0xA1);
         assert_eq!(payload[8], 1);
+    }
+
+    #[test]
+    fn strips_ipi_checksum_byte() {
+        let payload = normalize_ipi_pix_v1_payload(&[233, 80, 0, 10, 79, 64, 0, 68]);
+        assert_eq!(payload, vec![80, 0, 10, 79, 64, 0, 68]);
     }
 
     #[test]
