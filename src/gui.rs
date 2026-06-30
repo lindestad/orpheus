@@ -194,16 +194,27 @@ impl eframe::App for OrpheusGui {
                 });
 
                 ui.add_space(22.0);
+                let body_height = (ui.available_height() - 36.0).max(260.0);
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(286.0);
-                        draw_device_sidebar(ui, self);
-                    });
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(286.0, body_height),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_width(286.0);
+                            ui.set_height(body_height);
+                            draw_device_sidebar(ui, self);
+                        },
+                    );
                     ui.add_space(16.0);
-                    ui.vertical(|ui| {
-                        ui.set_width(ui.available_width());
-                        draw_device_detail(ui, self);
-                    });
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), body_height),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.set_height(body_height);
+                            draw_device_detail(ui, self);
+                        },
+                    );
                 });
 
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
@@ -231,61 +242,70 @@ fn status_bar(ui: &mut egui::Ui, app: &OrpheusGui) {
 }
 
 fn draw_device_sidebar(ui: &mut egui::Ui, app: &mut OrpheusGui) {
-    ui.label(RichText::new("Devices").strong().color(TEXT));
-    ui.add_space(10.0);
-
-    if app.devices.is_empty() {
-        empty_panel(ui, "No supported devices found.");
-        return;
-    }
-
-    ScrollArea::vertical()
-        .auto_shrink([false, false])
+    Frame::new()
+        .fill(SURFACE)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(14))
         .show(ui, |ui| {
-            for device in &app.devices {
-                let key = GuiDeviceKey::from_snapshot(device);
-                let selected = app.selected_device == Some(key);
-                let stroke = if selected {
-                    Stroke::new(1.0, SELECTED)
-                } else {
-                    Stroke::new(1.0, BORDER)
-                };
-                let response = Frame::new()
-                    .fill(if selected { SURFACE_RAISED } else { SURFACE })
-                    .stroke(stroke)
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::same(12))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} {}",
-                                        device.vendor_name, device.model_name
-                                    ))
-                                    .strong()
-                                    .color(TEXT),
-                                );
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{:04x}:{:04x} · {}",
-                                        device.vid, device.pid, device.connection
-                                    ))
-                                    .monospace()
-                                    .color(MUTED),
-                                );
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                status_badge(ui, device);
-                            });
-                        });
-                    })
-                    .response;
-                if response.clicked() {
-                    app.selected_device = Some(key);
-                }
-                ui.add_space(8.0);
+            ui.set_min_size(ui.available_size());
+            ui.label(RichText::new("Devices").strong().color(TEXT));
+            ui.add_space(10.0);
+
+            if app.devices.is_empty() {
+                empty_panel(ui, "No supported devices found.");
+                return;
             }
+
+            ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height(ui.available_height())
+                .show(ui, |ui| {
+                    for device in &app.devices {
+                        let key = GuiDeviceKey::from_snapshot(device);
+                        let selected = app.selected_device == Some(key);
+                        let stroke = if selected {
+                            Stroke::new(1.0, SELECTED)
+                        } else {
+                            Stroke::new(1.0, BORDER)
+                        };
+                        let response = Frame::new()
+                            .fill(if selected { SURFACE_RAISED } else { SURFACE })
+                            .stroke(stroke)
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} {}",
+                                                device.vendor_name, device.model_name
+                                            ))
+                                            .strong()
+                                            .color(TEXT),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{:04x}:{:04x} · {}",
+                                                device.vid, device.pid, device.connection
+                                            ))
+                                            .monospace()
+                                            .color(MUTED),
+                                        );
+                                    });
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        status_badge(ui, device);
+                                    });
+                                });
+                            })
+                            .response;
+                        if response.clicked() {
+                            app.selected_device = Some(key);
+                        }
+                        ui.add_space(8.0);
+                    }
+                });
         });
 }
 
@@ -304,6 +324,7 @@ fn draw_device_detail(ui: &mut egui::Ui, app: &mut OrpheusGui) {
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(20))
         .show(ui, |ui| {
+            ui.set_min_height(ui.available_height());
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(
