@@ -1,6 +1,6 @@
 [package]
 name = "orpheus-input"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Mouse polling-rate monitor and switcher for high-rate HID mice."
 license = "MIT"
