@@ -1,4 +1,4 @@
-# poll-monitor config
+# Orpheus config
 default_rate = 1000
 restore_rate = 1000
 scan_interval_ms = 1000

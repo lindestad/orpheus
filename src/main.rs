@@ -2,7 +2,7 @@ use std::{path::PathBuf, str::FromStr, thread, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use poll_monitor::{
+use orpheus::{
     config::{PollMonitorConfig, default_config_path},
     devices::{PollingRate, format_supported_rates},
     hid_device::HidPollMonitor,
@@ -11,7 +11,7 @@ use poll_monitor::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "poll-monitor")]
+#[command(name = "orpheus")]
 #[command(about = "Monitor and switch mouse polling rates")]
 struct Cli {
     #[command(subcommand)]
@@ -28,7 +28,7 @@ enum Command {
     Set { rate: String },
     /// Write an example app-rule config file.
     InitConfig {
-        #[arg(default_value = "poll-monitor.toml")]
+        #[arg(default_value = "orpheus.toml")]
         path: PathBuf,
     },
     /// Watch running processes and apply configured app rules.

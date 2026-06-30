@@ -1,7 +1,15 @@
 [package]
-name = "poll-monitor"
+name = "orpheus-input"
 version = "0.1.0"
 edition = "2024"
+
+[lib]
+name = "orpheus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "orpheus"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.103"

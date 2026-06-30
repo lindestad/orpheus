@@ -81,11 +81,19 @@ pub struct AppRule {
     pub restore: Option<PollingRate>,
 }
 
+const DEFAULT_CONFIG_PATH: &str = "orpheus.toml";
+const LEGACY_CONFIG_PATH: &str = "poll-monitor.toml";
+
 pub fn default_config_path() -> PathBuf {
-    PathBuf::from("poll-monitor.toml")
+    let default = PathBuf::from(DEFAULT_CONFIG_PATH);
+    if default.exists() || !Path::new(LEGACY_CONFIG_PATH).exists() {
+        default
+    } else {
+        PathBuf::from(LEGACY_CONFIG_PATH)
+    }
 }
 
-pub const EXAMPLE_CONFIG: &str = r#"# poll-monitor config
+pub const EXAMPLE_CONFIG: &str = r#"# Orpheus config
 default_rate = 1000
 restore_rate = 1000
 scan_interval_ms = 1000

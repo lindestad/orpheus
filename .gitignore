@@ -1,7 +1,8 @@
 # Rust build output
 /target/
 
-# Local runtime config. Keep poll-monitor.example.toml tracked.
+# Local runtime config. Keep orpheus.example.toml tracked.
+/orpheus.toml
 /poll-monitor.toml
 
 # Windows/debug artifacts

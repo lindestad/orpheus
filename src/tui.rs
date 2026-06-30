@@ -412,7 +412,7 @@ fn draw(frame: &mut Frame<'_>, app: &TuiApp) {
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let title = Line::from(vec![
         Span::styled(
-            "poll monitor",
+            "Orpheus",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

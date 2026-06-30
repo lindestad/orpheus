@@ -1,4 +1,4 @@
-# poll-monitor
+# Orpheus
 
 A small Windows-focused mouse polling-rate monitor and switcher.
 
@@ -45,13 +45,13 @@ cargo run -- init-config
 Watch running processes and apply configured app rules:
 
 ```powershell
-cargo run -- watch --config poll-monitor.toml
+cargo run -- watch --config orpheus.toml
 ```
 
 Validate the watcher without writing to the mouse:
 
 ```powershell
-cargo run -- watch --config poll-monitor.toml --dry-run --once
+cargo run -- watch --config orpheus.toml --dry-run --once
 ```
 
 ## TUI Controls
@@ -65,7 +65,7 @@ cargo run -- watch --config poll-monitor.toml --dry-run --once
 
 ## Config
 
-`poll-monitor.toml` is ignored by git so local app rules do not get committed. Use `poll-monitor.example.toml` as the tracked template.
+`orpheus.toml` is ignored by git so local app rules do not get committed. Use `orpheus.example.toml` as the tracked template. Existing `poll-monitor.toml` files are still accepted as a fallback.
 
 ```toml
 default_rate = 8000
