@@ -26,8 +26,7 @@ const MUTED: Color32 = Color32::from_rgb(161, 161, 161);
 const SUBTLE: Color32 = Color32::from_rgb(24, 24, 24);
 const BORDER: Color32 = Color32::from_rgb(38, 38, 38);
 const ERROR: Color32 = Color32::from_rgb(255, 69, 58);
-const OK: Color32 = Color32::from_rgb(0, 112, 243);
-const SELECTED: Color32 = Color32::from_rgb(255, 255, 255);
+const ACCENT: Color32 = Color32::from_rgb(245, 158, 11);
 
 pub fn run_gui() -> Result<()> {
     let options = eframe::NativeOptions {
@@ -265,7 +264,7 @@ fn draw_device_sidebar(ui: &mut egui::Ui, app: &mut OrpheusGui) {
                         let key = GuiDeviceKey::from_snapshot(device);
                         let selected = app.selected_device == Some(key);
                         let stroke = if selected {
-                            Stroke::new(1.0, SELECTED)
+                            Stroke::new(1.0, ACCENT)
                         } else {
                             Stroke::new(1.0, BORDER)
                         };
@@ -375,8 +374,8 @@ fn draw_device_detail(ui: &mut egui::Ui, app: &mut OrpheusGui) {
                         .monospace()
                         .color(if selected { BG } else { TEXT });
                     let button = Button::new(label)
-                        .fill(if selected { SELECTED } else { SUBTLE })
-                        .stroke(Stroke::new(1.0, if selected { SELECTED } else { BORDER }));
+                        .fill(if selected { ACCENT } else { SUBTLE })
+                        .stroke(Stroke::new(1.0, if selected { ACCENT } else { BORDER }));
                     let response = ui.add_sized([82.0, 34.0], button);
                     if response.clicked() {
                         app.targets.insert(key, *rate);
@@ -454,7 +453,7 @@ fn status_badge(ui: &mut egui::Ui, device: &DeviceSnapshot) {
     } else if device.battery_error.is_some() {
         ("battery", MUTED)
     } else {
-        ("live", OK)
+        ("live", ACCENT)
     };
     Frame::new()
         .fill(SURFACE)
@@ -573,9 +572,9 @@ fn install_geist_style(ctx: &egui::Context) {
     style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
     style.visuals.widgets.hovered.bg_fill = SUBTLE;
     style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
-    style.visuals.widgets.active.bg_fill = SELECTED;
+    style.visuals.widgets.active.bg_fill = ACCENT;
     style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, BG);
-    style.visuals.selection.bg_fill = SELECTED;
+    style.visuals.selection.bg_fill = ACCENT;
     style.visuals.selection.stroke = Stroke::new(1.0, BG);
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.button_padding = Vec2::new(12.0, 8.0);
