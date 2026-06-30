@@ -2,6 +2,11 @@
 name = "orpheus-input"
 version = "0.1.0"
 edition = "2024"
+description = "Mouse polling-rate monitor and switcher for high-rate HID mice."
+license = "MIT"
+repository = "https://github.com/lindestad/orpheus"
+readme = "README.md"
+keywords = ["mouse", "hid", "polling", "tui", "windows"]
 
 [lib]
 name = "orpheus"

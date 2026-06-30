@@ -127,3 +127,7 @@ For devices that report battery level but not charge state, the watcher treats `
 - Long-running TUI and watcher sessions keep the last valid rate and battery report for visible devices. If a device is still enumerated but stops answering control reads, the cached report is used for display and power policy decisions. The watcher queues writes when the current rate is cached or unknown and does not match the target, so the change is retried when the device answers again.
 - The TUI refreshes device telemetry every 1 second while focused, every 5 seconds while unfocused, and every 1 second while a user-initiated rate change is queued.
 - The long-term path is to keep this HID/control core and add a system tray UI around it later.
+
+## License
+
+The Orpheus source code is licensed under the MIT license. Bundled Geist font files in `assets/fonts` are licensed under the SIL Open Font License 1.1; see `assets/fonts/OFL.txt`.
