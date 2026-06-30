@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, DisableFocusChange, EnableFocusChange, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -23,21 +23,28 @@ use crate::{
     hid_device::{DeviceSnapshot, DeviceSnapshotCache, HidPollMonitor},
 };
 
-const REFRESH_INTERVAL: Duration = Duration::from_millis(5_000);
+const FOCUSED_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
+const UNFOCUSED_REFRESH_INTERVAL: Duration = Duration::from_millis(5_000);
 const PENDING_RETRY_INTERVAL: Duration = Duration::from_millis(1_000);
 const CHARGING_ICON: &str = "⚡";
 
 pub fn run_tui() -> Result<()> {
     enable_raw_mode().context("failed to enable raw terminal mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableFocusChange)
+        .context("failed to enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
     let result = run_app(&mut terminal);
 
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    execute!(
+        terminal.backend_mut(),
+        DisableFocusChange,
+        LeaveAlternateScreen
+    )
+    .ok();
     terminal.show_cursor().ok();
 
     result
@@ -56,21 +63,25 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
         }
 
         if event::poll(Duration::from_millis(150))? {
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Char('r') => app.refresh(&monitor),
-                KeyCode::Up | KeyCode::Char('k') => app.move_device(-1),
-                KeyCode::Down | KeyCode::Char('j') => app.move_device(1),
-                KeyCode::Left | KeyCode::Char('h') => app.move_rate(-1),
-                KeyCode::Right | KeyCode::Char('l') => app.move_rate(1),
-                KeyCode::Enter => app.apply_rate(&monitor),
-                KeyCode::Char(' ') => app.sync_target_to_current(),
+            match event::read()? {
+                Event::FocusGained => app.set_focused(true),
+                Event::FocusLost => app.set_focused(false),
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('r') => app.refresh(&monitor),
+                        KeyCode::Up | KeyCode::Char('k') => app.move_device(-1),
+                        KeyCode::Down | KeyCode::Char('j') => app.move_device(1),
+                        KeyCode::Left | KeyCode::Char('h') => app.move_rate(-1),
+                        KeyCode::Right | KeyCode::Char('l') => app.move_rate(1),
+                        KeyCode::Enter => app.apply_rate(&monitor),
+                        KeyCode::Char(' ') => app.sync_target_to_current(),
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -87,6 +98,7 @@ struct TuiApp {
     selected_device: usize,
     target_rate: Option<PollingRate>,
     target_dirty: bool,
+    focused: bool,
     status: String,
     last_refresh: Instant,
 }
@@ -100,8 +112,9 @@ impl TuiApp {
             selected_device: 0,
             target_rate: None,
             target_dirty: false,
+            focused: true,
             status: "scanning".to_string(),
-            last_refresh: Instant::now() - REFRESH_INTERVAL,
+            last_refresh: Instant::now() - FOCUSED_REFRESH_INTERVAL,
         }
     }
 
@@ -112,9 +125,15 @@ impl TuiApp {
     fn refresh_interval(&self) -> Duration {
         if self.pending_rate.is_some() {
             PENDING_RETRY_INTERVAL
+        } else if self.focused {
+            FOCUSED_REFRESH_INTERVAL
         } else {
-            REFRESH_INTERVAL
+            UNFOCUSED_REFRESH_INTERVAL
         }
+    }
+
+    fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
     }
 
     fn refresh(&mut self, monitor: &HidPollMonitor) {
@@ -681,8 +700,9 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Span::raw(" sync"),
     ]);
 
+    let focus = if app.focused { "focused" } else { "unfocused" };
     let refresh = format!(
-        "auto-refresh {} ms",
+        "auto-refresh {} ms ({focus})",
         app.refresh_interval().as_millis().saturating_sub(
             app.last_refresh
                 .elapsed()
@@ -726,9 +746,12 @@ mod tests {
     }
 
     #[test]
-    fn pending_rate_uses_retry_refresh_interval() {
+    fn refresh_interval_tracks_focus_and_pending_rate() {
         let mut app = TuiApp::new();
-        assert_eq!(app.refresh_interval(), REFRESH_INTERVAL);
+        assert_eq!(app.refresh_interval(), FOCUSED_REFRESH_INTERVAL);
+
+        app.set_focused(false);
+        assert_eq!(app.refresh_interval(), UNFOCUSED_REFRESH_INTERVAL);
 
         app.pending_rate = Some(PendingTuiRateChange {
             vid: 0x1234,

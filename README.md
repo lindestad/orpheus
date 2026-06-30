@@ -118,5 +118,5 @@ For devices that report battery level but not charge state, the watcher treats `
 - In first-device mode, the watcher writes only when the desired rule target changes.
 - In active-non-charging mode, the watcher queues a target rate for sleeping or temporarily unavailable devices and retries queued changes at `pending_retry_interval_ms`.
 - Long-running TUI and watcher sessions keep the last valid rate and battery report for visible devices. If a device is still enumerated but stops answering control reads, the cached report is used for display and power policy decisions. The watcher queues writes when the current rate is cached or unknown and does not match the target, so the change is retried when the device answers again.
-- The TUI refreshes device telemetry every 5 seconds by default and every 1 second while a user-initiated rate change is queued.
+- The TUI refreshes device telemetry every 1 second while focused, every 5 seconds while unfocused, and every 1 second while a user-initiated rate change is queued.
 - The long-term path is to keep this HID/control core and add a system tray UI around it later.
