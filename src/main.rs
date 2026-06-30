@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use orpheus::{
     config::{PollMonitorConfig, default_config_path},
     devices::{PollingRate, format_supported_rates},
+    gui::run_gui,
     hid_device::HidPollMonitor,
     tui::run_tui,
     watcher::run_watch,
@@ -20,6 +21,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Launch the native GUI.
+    Gui,
     /// Launch the interactive terminal UI.
     Tui,
     /// List supported devices and their current configured rate.
@@ -45,6 +48,7 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Tui) {
+        Command::Gui => run_gui(),
         Command::Tui => run_tui(),
         Command::List => list_devices(),
         Command::Set { rate } => set_rate(&rate),

@@ -2,7 +2,7 @@
 
 A small Windows-focused mouse polling-rate monitor and switcher.
 
-The current app is a Rust CLI/TUI. It reads the mouse's configured polling rate through HID feature/input reports, reads battery telemetry where the vendor protocol exposes it, can set a target rate, and can watch running processes to apply app-specific rate rules.
+The current app is a Rust CLI/TUI/GUI. It reads the mouse's configured polling rate through HID feature/input reports, reads battery telemetry where the vendor protocol exposes it, can set a target rate, and can watch running processes to apply app-specific rate rules.
 
 ## Status
 
@@ -19,6 +19,12 @@ Launch the TUI:
 
 ```powershell
 cargo run
+```
+
+Launch the native GUI:
+
+```powershell
+cargo run -- gui
 ```
 
 List supported devices, current configured polling rates, and battery telemetry:
@@ -113,6 +119,7 @@ For devices that report battery level but not charge state, the watcher treats `
 ## Design Notes
 
 - The TUI and watcher query the configured polling rate through device control reports, not by sampling pointer movement.
+- The GUI is built with `eframe`/`egui` and does not bundle Chromium. It uses vendored Geist Sans/Mono font files under `assets/fonts`.
 - Device support is implemented as per-vendor protocol adapters under one HID monitor path.
 - The watcher scans processes at `scan_interval_ms`, with a minimum interval of 250 ms. HID control reads are less frequent unless a rate change is pending.
 - In first-device mode, the watcher writes only when the desired rule target changes.
