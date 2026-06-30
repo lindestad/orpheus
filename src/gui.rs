@@ -1,11 +1,14 @@
 use std::{
     collections::HashMap,
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use eframe::{
     SurfaceConfig, WgpuConfiguration,
     egui::{
@@ -13,6 +16,7 @@ use eframe::{
         Frame, Layout, Margin, RichText, ScrollArea, Stroke, TextStyle, Theme, Vec2,
         ViewportBuilder, Visuals,
     },
+    egui_wgpu::{WgpuSetup, WgpuSetupCreateNew},
     wgpu,
 };
 
@@ -32,25 +36,82 @@ const BORDER: Color32 = Color32::from_rgb(38, 38, 38);
 const ERROR: Color32 = Color32::from_rgb(255, 69, 58);
 const ACCENT: Color32 = Color32::from_rgb(245, 158, 11);
 
-pub fn run_gui() -> Result<()> {
-    let options = eframe::NativeOptions {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GuiOptions {
+    pub software_renderer: bool,
+    pub steady_repaint: bool,
+}
+
+pub fn run_gui(gui_options: GuiOptions) -> Result<()> {
+    let native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("Orpheus")
             .with_inner_size([960.0, 640.0])
             .with_min_inner_size([760.0, 500.0]),
-        wgpu_options: WgpuConfiguration::default().with_surface_config(SurfaceConfig {
-            present_mode: wgpu::PresentMode::AutoNoVsync,
-            ..SurfaceConfig::LOW_LATENCY
-        }),
+        wgpu_options: gui_wgpu_options(gui_options),
         ..Default::default()
     };
 
     eframe::run_native(
         "Orpheus",
-        options,
-        Box::new(|cc| Ok(Box::new(OrpheusGui::new(cc)))),
+        native_options,
+        Box::new(move |cc| Ok(Box::new(OrpheusGui::new(cc, gui_options)))),
     )?;
     Ok(())
+}
+
+fn gui_wgpu_options(options: GuiOptions) -> WgpuConfiguration {
+    let mut wgpu_options = WgpuConfiguration::default().with_surface_config(SurfaceConfig {
+        present_mode: wgpu::PresentMode::AutoVsync,
+        ..SurfaceConfig::LOW_LATENCY
+    });
+
+    if options.software_renderer {
+        let mut setup = WgpuSetupCreateNew::without_display_handle();
+        setup.instance_descriptor.backends = wgpu::Backends::DX12;
+        setup.power_preference = wgpu::PowerPreference::LowPower;
+        setup.native_adapter_selector = Some(Arc::new(select_software_adapter));
+        wgpu_options.wgpu_setup = WgpuSetup::CreateNew(setup);
+    }
+
+    wgpu_options
+}
+
+fn select_software_adapter(
+    adapters: &[wgpu::Adapter],
+    surface: Option<&wgpu::Surface<'_>>,
+) -> std::result::Result<wgpu::Adapter, String> {
+    adapters
+        .iter()
+        .filter(|adapter| surface.is_none_or(|surface| adapter.is_surface_supported(surface)))
+        .find(|adapter| {
+            let info = adapter.get_info();
+            info.device_type == wgpu::DeviceType::Cpu || is_windows_software_adapter(&info.name)
+        })
+        .cloned()
+        .with_context(|| describe_adapter_failure(adapters))
+        .map_err(|err| err.to_string())
+}
+
+fn is_windows_software_adapter(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("warp") || name.contains("microsoft basic render")
+}
+
+fn describe_adapter_failure(adapters: &[wgpu::Adapter]) -> String {
+    let adapters = adapters
+        .iter()
+        .map(|adapter| {
+            let info = adapter.get_info();
+            format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if adapters.is_empty() {
+        "no wgpu adapters were available for software rendering".to_string()
+    } else {
+        format!("no software/WARP adapter was available; found: {adapters}")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -71,6 +132,7 @@ impl GuiDeviceKey {
 }
 
 struct OrpheusGui {
+    options: GuiOptions,
     worker: GuiWorker,
     devices: Vec<DeviceSnapshot>,
     selected_device: Option<GuiDeviceKey>,
@@ -81,11 +143,12 @@ struct OrpheusGui {
 }
 
 impl OrpheusGui {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, options: GuiOptions) -> Self {
         install_geist_fonts(&cc.egui_ctx);
         install_geist_style(&cc.egui_ctx);
 
         Self {
+            options,
             worker: GuiWorker::spawn(),
             devices: Vec::new(),
             selected_device: None,
@@ -177,7 +240,13 @@ impl OrpheusGui {
 impl eframe::App for OrpheusGui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_worker_events();
-        ui.ctx().request_repaint_after(REFRESH_INTERVAL);
+        let focused = ui.ctx().input(|input| input.focused);
+        let repaint_interval = if self.options.steady_repaint && focused {
+            Duration::from_millis(16)
+        } else {
+            REFRESH_INTERVAL
+        };
+        ui.ctx().request_repaint_after(repaint_interval);
 
         Frame::new()
             .fill(BG)

@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use orpheus::{
     config::{PollMonitorConfig, default_config_path},
     devices::{PollingRate, format_supported_rates},
-    gui::run_gui,
+    gui::{GuiOptions, run_gui},
     hid_device::HidPollMonitor,
     tui::run_tui,
     watcher::run_watch,
@@ -22,7 +22,14 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Launch the native GUI.
-    Gui,
+    Gui {
+        /// Prefer Windows software/WARP rendering to avoid NVIDIA windowed VRR capture.
+        #[arg(long)]
+        software_renderer: bool,
+        /// Repaint at 60 Hz while focused if VRR still captures the window.
+        #[arg(long)]
+        steady_repaint: bool,
+    },
     /// Launch the interactive terminal UI.
     Tui,
     /// List supported devices and their current configured rate.
@@ -48,7 +55,13 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Tui) {
-        Command::Gui => run_gui(),
+        Command::Gui {
+            software_renderer,
+            steady_repaint,
+        } => run_gui(GuiOptions {
+            software_renderer,
+            steady_repaint,
+        }),
         Command::Tui => run_tui(),
         Command::List => list_devices(),
         Command::Set { rate } => set_rate(&rate),

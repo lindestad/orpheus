@@ -27,6 +27,18 @@ Launch the native GUI:
 cargo run -- gui
 ```
 
+If NVIDIA G-SYNC/VRR captures the focused GUI window and drops the display refresh rate, try the software-rendering path first:
+
+```powershell
+cargo run -- gui --software-renderer
+```
+
+If the driver still captures the window, use steady repainting as a fallback:
+
+```powershell
+cargo run -- gui --steady-repaint
+```
+
 List supported devices, current configured polling rates, and battery telemetry:
 
 ```powershell
@@ -120,6 +132,7 @@ For devices that report battery level but not charge state, the watcher treats `
 
 - The TUI and watcher query the configured polling rate through device control reports, not by sampling pointer movement.
 - The GUI is built with `eframe`/`egui` and does not bundle Chromium. It uses vendored Geist Sans/Mono font files under `assets/fonts`.
+- The GUI defaults to vsync presentation. `--software-renderer` asks wgpu for the Windows DX12 software/WARP adapter, and `--steady-repaint` keeps the focused GUI at 60 Hz for drivers that still apply windowed VRR.
 - Device support is implemented as per-vendor protocol adapters under one HID monitor path.
 - The watcher scans processes at `scan_interval_ms`, with a minimum interval of 250 ms. HID control reads are less frequent unless a rate change is pending.
 - In first-device mode, the watcher writes only when the desired rule target changes.
