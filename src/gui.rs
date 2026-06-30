@@ -6,10 +6,14 @@ use std::{
 };
 
 use anyhow::Result;
-use eframe::egui::{
-    self, Align, Button, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
-    Frame, Layout, Margin, RichText, ScrollArea, Stroke, TextStyle, Theme, Vec2, ViewportBuilder,
-    Visuals,
+use eframe::{
+    SurfaceConfig, WgpuConfiguration,
+    egui::{
+        self, Align, Button, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
+        Frame, Layout, Margin, RichText, ScrollArea, Stroke, TextStyle, Theme, Vec2,
+        ViewportBuilder, Visuals,
+    },
+    wgpu,
 };
 
 use crate::{
@@ -34,6 +38,10 @@ pub fn run_gui() -> Result<()> {
             .with_title("Orpheus")
             .with_inner_size([960.0, 640.0])
             .with_min_inner_size([760.0, 500.0]),
+        wgpu_options: WgpuConfiguration::default().with_surface_config(SurfaceConfig {
+            present_mode: wgpu::PresentMode::AutoNoVsync,
+            ..SurfaceConfig::LOW_LATENCY
+        }),
         ..Default::default()
     };
 
@@ -169,7 +177,7 @@ impl OrpheusGui {
 impl eframe::App for OrpheusGui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_worker_events();
-        ui.ctx().request_repaint_after(Duration::from_millis(250));
+        ui.ctx().request_repaint_after(REFRESH_INTERVAL);
 
         Frame::new()
             .fill(BG)
