@@ -18,14 +18,16 @@ use crate::{
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
-const BG: Color32 = Color32::from_rgb(250, 250, 250);
-const SURFACE: Color32 = Color32::from_rgb(255, 255, 255);
-const TEXT: Color32 = Color32::from_rgb(17, 17, 17);
-const MUTED: Color32 = Color32::from_rgb(102, 102, 102);
-const SUBTLE: Color32 = Color32::from_rgb(245, 245, 245);
-const BORDER: Color32 = Color32::from_rgb(229, 229, 229);
-const ERROR: Color32 = Color32::from_rgb(220, 38, 38);
+const BG: Color32 = Color32::from_rgb(0, 0, 0);
+const SURFACE: Color32 = Color32::from_rgb(10, 10, 10);
+const SURFACE_RAISED: Color32 = Color32::from_rgb(18, 18, 18);
+const TEXT: Color32 = Color32::from_rgb(237, 237, 237);
+const MUTED: Color32 = Color32::from_rgb(161, 161, 161);
+const SUBTLE: Color32 = Color32::from_rgb(24, 24, 24);
+const BORDER: Color32 = Color32::from_rgb(38, 38, 38);
+const ERROR: Color32 = Color32::from_rgb(255, 69, 58);
 const OK: Color32 = Color32::from_rgb(0, 112, 243);
+const SELECTED: Color32 = Color32::from_rgb(255, 255, 255);
 
 pub fn run_gui() -> Result<()> {
     let options = eframe::NativeOptions {
@@ -244,12 +246,12 @@ fn draw_device_sidebar(ui: &mut egui::Ui, app: &mut OrpheusGui) {
                 let key = GuiDeviceKey::from_snapshot(device);
                 let selected = app.selected_device == Some(key);
                 let stroke = if selected {
-                    Stroke::new(1.0, TEXT)
+                    Stroke::new(1.0, SELECTED)
                 } else {
                     Stroke::new(1.0, BORDER)
                 };
                 let response = Frame::new()
-                    .fill(SURFACE)
+                    .fill(if selected { SURFACE_RAISED } else { SURFACE })
                     .stroke(stroke)
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::same(12))
@@ -350,10 +352,10 @@ fn draw_device_detail(ui: &mut egui::Ui, app: &mut OrpheusGui) {
                     let selected = target == Some(*rate);
                     let label = RichText::new(format!("{} Hz", rate.hz()))
                         .monospace()
-                        .color(if selected { SURFACE } else { TEXT });
+                        .color(if selected { BG } else { TEXT });
                     let button = Button::new(label)
-                        .fill(if selected { TEXT } else { SUBTLE })
-                        .stroke(Stroke::new(1.0, if selected { TEXT } else { BORDER }));
+                        .fill(if selected { SELECTED } else { SUBTLE })
+                        .stroke(Stroke::new(1.0, if selected { SELECTED } else { BORDER }));
                     let response = ui.add_sized([82.0, 34.0], button);
                     if response.clicked() {
                         app.targets.insert(key, *rate);
@@ -401,7 +403,7 @@ fn draw_device_detail(ui: &mut egui::Ui, app: &mut OrpheusGui) {
 
 fn metric(ui: &mut egui::Ui, label: &str, value: String) {
     Frame::new()
-        .fill(SUBTLE)
+        .fill(SURFACE_RAISED)
         .stroke(Stroke::new(1.0, BORDER))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(12))
@@ -445,8 +447,8 @@ fn status_badge(ui: &mut egui::Ui, device: &DeviceSnapshot) {
 
 fn error_line(ui: &mut egui::Ui, label: &str, message: &str) {
     Frame::new()
-        .fill(Color32::from_rgb(255, 245, 245))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(254, 202, 202)))
+        .fill(Color32::from_rgb(37, 9, 9))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(127, 29, 29)))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(12))
         .show(ui, |ui| {
@@ -541,17 +543,19 @@ fn install_geist_fonts(ctx: &egui::Context) {
 }
 
 fn install_geist_style(ctx: &egui::Context) {
-    ctx.set_theme(Theme::Light);
-    let mut style = (*ctx.style_of(Theme::Light)).clone();
-    style.visuals = Visuals::light();
+    ctx.set_theme(Theme::Dark);
+    let mut style = (*ctx.style_of(Theme::Dark)).clone();
+    style.visuals = Visuals::dark();
     style.visuals.window_fill = BG;
     style.visuals.panel_fill = BG;
     style.visuals.widgets.inactive.bg_fill = SURFACE;
     style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
     style.visuals.widgets.hovered.bg_fill = SUBTLE;
     style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
-    style.visuals.widgets.active.bg_fill = TEXT;
-    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, SURFACE);
+    style.visuals.widgets.active.bg_fill = SELECTED;
+    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, BG);
+    style.visuals.selection.bg_fill = SELECTED;
+    style.visuals.selection.stroke = Stroke::new(1.0, BG);
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.button_padding = Vec2::new(12.0, 8.0);
     style.text_styles.insert(
@@ -569,7 +573,7 @@ fn install_geist_style(ctx: &egui::Context) {
         TextStyle::Monospace,
         FontId::new(13.0, FontFamily::Monospace),
     );
-    ctx.set_style_of(Theme::Light, style);
+    ctx.set_style_of(Theme::Dark, style);
 }
 
 struct GuiWorker {
