@@ -13,6 +13,11 @@ This is an early working prototype. It has been tested against:
 
 Supported model IDs currently cover known Fenrir, Fenrir Pro, and Fenir Max wired/receiver IDs from G-Wolves WebHID protocol data, plus IPI Piao/Float-style PIX v1 mouse IDs from `https://shan.ipigame.cn/devices`.
 
+Additional protocol support has been implemented from WebHID driver references, but has not yet been verified with local hardware:
+
+- Logitech HID++ 2.0: Lightspeed Receiver, PRO X SUPERLIGHT, and PRO X SUPERLIGHT 2 IDs. Orpheus can set 125/250/500/1000 Hz and read battery telemetry where the HID++ battery feature answers. Current polling-rate reads are not known for this protocol yet, so the UI may show `unknown` for current rate.
+- Razer v1 feature reports: Viper, DeathAdder, Basilisk, and Naga IDs from the WebHID driver table. Orpheus can send polling-rate changes and read battery/charging telemetry from the Razer control interface. Current polling-rate reads are not known for this protocol yet, so the UI may show `unknown` for current rate.
+
 ## Usage
 
 Launch the TUI:

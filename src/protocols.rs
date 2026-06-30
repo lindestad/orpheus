@@ -16,6 +16,27 @@ pub const FEATURE_PAYLOAD_LEN: usize = 64;
 pub const REPORT8_PAYLOAD_LEN: usize = 16;
 pub const REPORT8_BUFFER_LEN: usize = REPORT8_PAYLOAD_LEN + 1;
 pub const IPI_PIX_PAYLOAD_LEN: usize = 63;
+pub const RAZER_V1_REPORT_ID: u8 = 0;
+pub const RAZER_V1_PAYLOAD_LEN: usize = 90;
+pub const HIDPP_SHORT_ID: u8 = 0x10;
+pub const HIDPP_LONG_ID: u8 = 0x11;
+pub const HIDPP_SHORT_PAYLOAD_LEN: usize = 6;
+pub const HIDPP_LONG_PAYLOAD_LEN: usize = 19;
+
+const HIDPP_DEVICE_INDEX: u8 = 0x01;
+const HIDPP_ROOT_FEATURE_INDEX: u8 = 0x00;
+const HIDPP_SW_ID: u8 = 0x0D;
+const HIDPP_REPORT_RATE_FEATURE_ID: u16 = 0x8060;
+const HIDPP_UNIFIED_BATTERY_FEATURE_ID: u16 = 0x1004;
+const HIDPP_BATTERY_STATUS_FEATURE_ID: u16 = 0x1000;
+const HIDPP_REPORT_RATE_FALLBACK_INDEX: u8 = 0x0A;
+const HIDPP_SCAN_DISCOVERY_TIMEOUT_MS: i32 = 500;
+const HIDPP_BATTERY_TIMEOUT_MS: i32 = 1_500;
+
+const RAZER_STATUS_NEW: u8 = 0x00;
+const RAZER_STATUS_BUSY: u8 = 0x01;
+const RAZER_STATUS_SUCCESS: u8 = 0x02;
+const RAZER_STATUS_FAILURE: u8 = 0x03;
 
 pub trait DeviceTransport {
     fn send_feature_payload(&self, report_id: u8, payload: &[u8]) -> Result<()>;
@@ -60,6 +81,12 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
             ProtocolKind::Feature64 { .. } => self.read_feature64_rate(),
             ProtocolKind::Eeprom16 => self.read_eeprom16_rate(),
             ProtocolKind::IpiPixV1 { .. } => self.read_ipi_pix_v1_rate(),
+            ProtocolKind::LogitechHidpp => Err(anyhow!(
+                "current polling-rate read is not implemented for logitech hid++ protocol"
+            )),
+            ProtocolKind::RazerV1 { .. } => Err(anyhow!(
+                "current polling-rate read is not implemented for razer v1 protocol"
+            )),
         }
     }
 
@@ -67,6 +94,8 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
         match self.protocol {
             ProtocolKind::Feature64 { .. } => self.read_feature64_battery(),
             ProtocolKind::IpiPixV1 { .. } => self.read_ipi_pix_v1_battery(),
+            ProtocolKind::LogitechHidpp => self.read_logitech_hidpp_battery(),
+            ProtocolKind::RazerV1 { .. } => self.read_razer_v1_battery(),
             ProtocolKind::Eeprom16 => Err(anyhow!(
                 "battery telemetry is not implemented for report8 eeprom protocol"
             )),
@@ -79,6 +108,27 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
             ProtocolKind::Feature64 { .. } => self.set_feature64_rate(rate),
             ProtocolKind::Eeprom16 => self.set_eeprom16_rate(rate),
             ProtocolKind::IpiPixV1 { .. } => self.set_ipi_pix_v1_rate(rate),
+            ProtocolKind::LogitechHidpp => self.set_logitech_hidpp_rate(rate),
+            ProtocolKind::RazerV1 { .. } => self.set_razer_v1_rate(rate),
+        }
+    }
+
+    pub fn probe_control(&self) -> Result<()> {
+        match self.protocol {
+            ProtocolKind::Feature64 { .. }
+            | ProtocolKind::Eeprom16
+            | ProtocolKind::IpiPixV1 { .. } => self.read_rate().map(|_| ()),
+            ProtocolKind::LogitechHidpp => self
+                .discover_logitech_hidpp_feature(
+                    HIDPP_REPORT_RATE_FEATURE_ID,
+                    HIDPP_SCAN_DISCOVERY_TIMEOUT_MS,
+                )
+                .map(|_| ())
+                .ok_or_else(|| anyhow!("logitech hid++ control feature did not answer")),
+            ProtocolKind::RazerV1 { tx_id, .. } => {
+                let command = build_razer_v1_command(tx_id, 0x07, 0x80, 0x02, &[0x00, 0x00]);
+                self.send_razer_v1_and_recv(&command).map(|_| ())
+            }
         }
     }
 
@@ -120,7 +170,10 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
                 new_protocol: false,
                 ..
             } => 50,
-            ProtocolKind::Eeprom16 | ProtocolKind::IpiPixV1 { .. } => unreachable!(),
+            ProtocolKind::Eeprom16
+            | ProtocolKind::IpiPixV1 { .. }
+            | ProtocolKind::LogitechHidpp
+            | ProtocolKind::RazerV1 { .. } => unreachable!(),
         };
         self.transport.sleep(Duration::from_millis(delay));
         let response = self
@@ -190,6 +243,177 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
             .copied()
             .ok_or_else(|| anyhow!("short ipi pix v1 response while reading battery"))?;
         Ok(BatteryStatus::level_only(level))
+    }
+
+    fn set_logitech_hidpp_rate(&self, rate: PollingRate) -> Result<()> {
+        let rate_code = rate
+            .logitech_hidpp_code()
+            .ok_or_else(|| anyhow!("unsupported logitech hid++ polling rate {rate}"))?;
+        let feature_index = self
+            .discover_logitech_hidpp_feature(HIDPP_REPORT_RATE_FEATURE_ID, 2_000)
+            .unwrap_or(HIDPP_REPORT_RATE_FALLBACK_INDEX);
+        self.transport.write_output_payload(
+            HIDPP_SHORT_ID,
+            &[0xFF, feature_index, 0x2E, rate_code, 0x00, 0x00],
+        )?;
+        Ok(())
+    }
+
+    fn read_logitech_hidpp_battery(&self) -> Result<BatteryStatus> {
+        let feature_index = self
+            .discover_logitech_hidpp_feature(
+                HIDPP_UNIFIED_BATTERY_FEATURE_ID,
+                HIDPP_SCAN_DISCOVERY_TIMEOUT_MS,
+            )
+            .or_else(|| {
+                self.discover_logitech_hidpp_feature(
+                    HIDPP_BATTERY_STATUS_FEATURE_ID,
+                    HIDPP_SCAN_DISCOVERY_TIMEOUT_MS,
+                )
+            })
+            .ok_or_else(|| anyhow!("battery feature not found on this logitech hid++ device"))?;
+        let query = [HIDPP_DEVICE_INDEX, feature_index, 0x1D, 0x00, 0x00, 0x00];
+        self.transport
+            .write_output_payload(HIDPP_SHORT_ID, &query)?;
+        self.transport.sleep(Duration::from_millis(500));
+        self.transport
+            .write_output_payload(HIDPP_SHORT_ID, &query)?;
+
+        let response = self
+            .read_logitech_hidpp_matching(
+                |payload| {
+                    payload.first() == Some(&HIDPP_DEVICE_INDEX)
+                        && payload.get(1) == Some(&feature_index)
+                },
+                HIDPP_BATTERY_TIMEOUT_MS,
+            )?
+            .ok_or_else(|| {
+                anyhow!("battery query timed out; device may be asleep or out of range")
+            })?;
+        let level = response.get(3).copied().unwrap_or_default().min(100);
+        let raw_state = response.get(5).copied().unwrap_or_default();
+        Ok(BatteryStatus::with_raw_state(
+            level,
+            logitech_charge_state_from_status(raw_state),
+            raw_state,
+        ))
+    }
+
+    fn set_razer_v1_rate(&self, rate: PollingRate) -> Result<()> {
+        let ProtocolKind::RazerV1 {
+            tx_id,
+            polling_reversed,
+        } = self.protocol
+        else {
+            unreachable!("razer writer called for non-razer protocol")
+        };
+        let mask = rate.razer_v1_mask(polling_reversed);
+        let command = build_razer_v1_command(tx_id, 0x00, 0x40, 0x02, &[0x01, mask]);
+        self.transport
+            .send_feature_payload(RAZER_V1_REPORT_ID, &command)?;
+        Ok(())
+    }
+
+    fn read_razer_v1_battery(&self) -> Result<BatteryStatus> {
+        let ProtocolKind::RazerV1 { tx_id, .. } = self.protocol else {
+            unreachable!("razer battery reader called for non-razer protocol")
+        };
+        let level_command = build_razer_v1_command(tx_id, 0x07, 0x80, 0x02, &[0x00, 0x00]);
+        let level_response = self.send_razer_v1_and_recv(&level_command)?;
+        let raw_level = *level_response
+            .get(9)
+            .ok_or_else(|| anyhow!("short razer v1 battery level response"))?;
+        let level = ((u16::from(raw_level) * 100 + 127) / 255) as u8;
+
+        self.transport.sleep(Duration::from_millis(60));
+        let charge_command = build_razer_v1_command(tx_id, 0x07, 0x84, 0x02, &[0x00, 0x00]);
+        let charge_response = self.send_razer_v1_and_recv(&charge_command)?;
+        let raw_state = *charge_response
+            .get(9)
+            .ok_or_else(|| anyhow!("short razer v1 charging-state response"))?;
+        let charge_state = if raw_state == 0 {
+            crate::devices::ChargeState::Discharging
+        } else {
+            crate::devices::ChargeState::Charging
+        };
+        Ok(BatteryStatus::with_raw_state(
+            level,
+            charge_state,
+            raw_state,
+        ))
+    }
+
+    fn discover_logitech_hidpp_feature(&self, feature_id: u16, timeout_ms: i32) -> Option<u8> {
+        let payload = [
+            HIDPP_DEVICE_INDEX,
+            HIDPP_ROOT_FEATURE_INDEX,
+            HIDPP_SW_ID,
+            (feature_id >> 8) as u8,
+            feature_id as u8,
+            0x00,
+        ];
+        self.transport
+            .write_output_payload(HIDPP_SHORT_ID, &payload)
+            .ok()?;
+        let response = self
+            .read_logitech_hidpp_matching(
+                |payload| {
+                    payload.first() == Some(&HIDPP_DEVICE_INDEX)
+                        && payload.get(1) == Some(&HIDPP_ROOT_FEATURE_INDEX)
+                },
+                timeout_ms,
+            )
+            .ok()??;
+        match response.get(3).copied() {
+            Some(0) | None => None,
+            Some(index) => Some(index),
+        }
+    }
+
+    fn read_logitech_hidpp_matching(
+        &self,
+        matches_response: impl Fn(&[u8]) -> bool,
+        timeout_ms: i32,
+    ) -> Result<Option<Vec<u8>>> {
+        let step_ms = 50;
+        let attempts = (timeout_ms.max(1) as usize).div_ceil(step_ms).max(1);
+        for _ in 0..attempts {
+            let response = self.transport.read_input_payload(
+                HIDPP_LONG_ID,
+                HIDPP_LONG_PAYLOAD_LEN,
+                step_ms as i32,
+            )?;
+            if response.is_empty() {
+                continue;
+            }
+            let response = normalize_logitech_hidpp_payload(&response);
+            if matches_response(&response) {
+                return Ok(Some(response));
+            }
+        }
+        Ok(None)
+    }
+
+    fn send_razer_v1_and_recv(&self, command: &[u8; RAZER_V1_PAYLOAD_LEN]) -> Result<Vec<u8>> {
+        self.transport
+            .send_feature_payload(RAZER_V1_REPORT_ID, command)?;
+        for attempt in 0..10 {
+            self.transport
+                .sleep(Duration::from_millis(20 + attempt * 10));
+            let response = self
+                .transport
+                .get_feature_payload(RAZER_V1_REPORT_ID, RAZER_V1_PAYLOAD_LEN)?;
+            if response.is_empty() {
+                continue;
+            }
+            match response[0] {
+                RAZER_STATUS_SUCCESS => return Ok(response),
+                RAZER_STATUS_FAILURE => return Err(anyhow!("razer v1 command returned failure")),
+                RAZER_STATUS_BUSY | RAZER_STATUS_NEW => continue,
+                status => return Err(anyhow!("razer v1 command returned unknown status {status}")),
+            }
+        }
+        Err(anyhow!("timed out waiting for razer v1 command response"))
     }
 
     fn get_ipi_pix_v1_response(
@@ -312,7 +536,10 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
                     return Ok((state, level));
                 }
             }
-            ProtocolKind::Eeprom16 | ProtocolKind::IpiPixV1 { .. } => {
+            ProtocolKind::Eeprom16
+            | ProtocolKind::IpiPixV1 { .. }
+            | ProtocolKind::LogitechHidpp
+            | ProtocolKind::RazerV1 { .. } => {
                 unreachable!("feature64 battery parser called for non-feature64 protocol")
             }
         }
@@ -346,7 +573,10 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
                 }
                 Ok(code)
             }
-            ProtocolKind::Eeprom16 | ProtocolKind::IpiPixV1 { .. } => {
+            ProtocolKind::Eeprom16
+            | ProtocolKind::IpiPixV1 { .. }
+            | ProtocolKind::LogitechHidpp
+            | ProtocolKind::RazerV1 { .. } => {
                 unreachable!("feature64 parser called for non-feature64 protocol")
             }
         }
@@ -377,6 +607,14 @@ pub fn normalize_report8_payload(raw: &[u8]) -> Vec<u8> {
     normalize_report_payload(raw, REPORT8_ID, REPORT8_PAYLOAD_LEN)
 }
 
+pub fn normalize_logitech_hidpp_payload(raw: &[u8]) -> Vec<u8> {
+    if raw.first() == Some(&HIDPP_SHORT_ID) || raw.first() == Some(&HIDPP_LONG_ID) {
+        raw[1..].to_vec()
+    } else {
+        raw.to_vec()
+    }
+}
+
 pub fn report8_crc(payload: &[u8; REPORT8_PAYLOAD_LEN]) -> u8 {
     let sum = payload
         .iter()
@@ -389,12 +627,47 @@ pub fn write_report8_crc(payload: &mut [u8; REPORT8_PAYLOAD_LEN]) {
     payload[15] = report8_crc(payload).wrapping_sub(REPORT8_ID);
 }
 
+pub fn build_razer_v1_command(
+    tx_id: u8,
+    class: u8,
+    id: u8,
+    size: u8,
+    args: &[u8],
+) -> [u8; RAZER_V1_PAYLOAD_LEN] {
+    let mut payload = [0; RAZER_V1_PAYLOAD_LEN];
+    payload[0] = RAZER_STATUS_NEW;
+    payload[1] = tx_id;
+    payload[5] = size;
+    payload[6] = class;
+    payload[7] = id;
+    for (index, byte) in args.iter().take(80).enumerate() {
+        payload[8 + index] = *byte;
+    }
+    payload[88] = razer_v1_crc(&payload);
+    payload
+}
+
+pub fn razer_v1_crc(payload: &[u8; RAZER_V1_PAYLOAD_LEN]) -> u8 {
+    payload[2..88].iter().fold(0, |crc, byte| crc ^ byte)
+}
+
+pub fn logitech_charge_state_from_status(status: u8) -> crate::devices::ChargeState {
+    match status {
+        0x00 | 0x04 => crate::devices::ChargeState::Discharging,
+        0x01 | 0x02 => crate::devices::ChargeState::Charging,
+        0x03 => crate::devices::ChargeState::Full,
+        raw => crate::devices::ChargeState::Raw(raw),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, collections::VecDeque, time::Duration};
 
     use super::*;
-    use crate::devices::{GWOLVES_VENDOR_ID, RATES_8K};
+    use crate::devices::{
+        GWOLVES_VENDOR_ID, LOGITECH_VENDOR_ID, RATES_1K, RATES_8K, RAZER_VENDOR_ID,
+    };
 
     static TEST_MODEL: ModelInfo = ModelInfo {
         vendor_name: "Test",
@@ -407,6 +680,37 @@ mod tests {
         protocol: ProtocolKind::Feature64 {
             new_protocol: true,
             wired_device_id: 2,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    };
+
+    static LOGITECH_TEST_MODEL: ModelInfo = ModelInfo {
+        vendor_name: "Logitech",
+        name: "Test Logitech",
+        vid: LOGITECH_VENDOR_ID,
+        wired_pid: Some(0xC09B),
+        wireless_pid: None,
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::LogitechHidpp,
+        wired_rates: RATES_1K,
+        wireless_rates: RATES_1K,
+        receiver_rates: RATES_1K,
+    };
+
+    static RAZER_TEST_MODEL: ModelInfo = ModelInfo {
+        vendor_name: "Razer",
+        name: "Test Razer",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: Some(0x00C0),
+        wireless_pid: None,
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0x1F,
+            polling_reversed: true,
         },
         wired_rates: RATES_8K,
         wireless_rates: RATES_8K,
@@ -500,6 +804,12 @@ mod tests {
     }
 
     #[test]
+    fn strips_logitech_hidpp_report_id() {
+        let payload = normalize_logitech_hidpp_payload(&[HIDPP_LONG_ID, 1, 0, 0, 7]);
+        assert_eq!(payload, vec![1, 0, 0, 7]);
+    }
+
+    #[test]
     fn computes_report8_crc_like_web_driver() {
         let mut report = build_eeprom16_set_rate(PollingRate::Hz8000);
         write_report8_crc(&mut report);
@@ -550,5 +860,128 @@ mod tests {
         assert_eq!(writes[0].0, REPORT8_ID);
         assert_eq!(&writes[0].1[0..7], &[7, 0, 0, 0, 2, 64, 21]);
         assert_eq!(writes[0].1[15], 239);
+    }
+
+    #[test]
+    fn builds_razer_v1_command_crc_like_web_driver() {
+        let command = build_razer_v1_command(0x1F, 0x00, 0x40, 0x02, &[0x01, 0x01]);
+        assert_eq!(&command[0..10], &[0, 0x1F, 0, 0, 0, 2, 0, 0x40, 1, 1]);
+        assert_eq!(command[88], razer_v1_crc(&command));
+    }
+
+    #[test]
+    fn simulated_razer_rate_set_uses_reversed_mask() {
+        let transport = ScriptedTransport::with_feature_reads([]);
+        let protocol = ProtocolDevice::new(
+            &transport,
+            &RAZER_TEST_MODEL,
+            ConnectionKind::Wired,
+            ProtocolKind::RazerV1 {
+                tx_id: 0x1F,
+                polling_reversed: true,
+            },
+        );
+
+        protocol.set_rate(PollingRate::Hz8000).unwrap();
+        let writes = transport.feature_writes.borrow();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, RAZER_V1_REPORT_ID);
+        assert_eq!(&writes[0].1[5..10], &[2, 0, 0x40, 1, 1]);
+        assert_eq!(
+            writes[0].1[88],
+            razer_v1_crc(writes[0].1.as_slice().try_into().unwrap())
+        );
+    }
+
+    #[test]
+    fn simulated_razer_battery_reads_level_and_charging() {
+        let mut level = vec![0; RAZER_V1_PAYLOAD_LEN];
+        level[0] = RAZER_STATUS_SUCCESS;
+        level[9] = 204;
+        let mut charging = vec![0; RAZER_V1_PAYLOAD_LEN];
+        charging[0] = RAZER_STATUS_SUCCESS;
+        charging[9] = 1;
+        let transport = ScriptedTransport::with_feature_reads([level, charging]);
+        let protocol = ProtocolDevice::new(
+            &transport,
+            &RAZER_TEST_MODEL,
+            ConnectionKind::Wired,
+            ProtocolKind::RazerV1 {
+                tx_id: 0x1F,
+                polling_reversed: true,
+            },
+        );
+
+        let battery = protocol.read_battery().unwrap();
+        assert_eq!(battery.level_percent, Some(80));
+        assert_eq!(battery.charge_state, crate::devices::ChargeState::Charging);
+        assert_eq!(transport.feature_writes.borrow().len(), 2);
+    }
+
+    #[test]
+    fn simulated_logitech_rate_set_discovers_report_rate_feature() {
+        let mut report_rate_feature = vec![0; HIDPP_LONG_PAYLOAD_LEN];
+        report_rate_feature[0] = HIDPP_DEVICE_INDEX;
+        report_rate_feature[1] = HIDPP_ROOT_FEATURE_INDEX;
+        report_rate_feature[3] = 0x0A;
+        let transport = ScriptedTransport {
+            feature_reads: RefCell::new(VecDeque::new()),
+            feature_writes: RefCell::new(Vec::new()),
+            input_reads: RefCell::new(VecDeque::from([report_rate_feature])),
+            output_writes: RefCell::new(Vec::new()),
+        };
+        let protocol = ProtocolDevice::new(
+            &transport,
+            &LOGITECH_TEST_MODEL,
+            ConnectionKind::Wired,
+            ProtocolKind::LogitechHidpp,
+        );
+
+        protocol.set_rate(PollingRate::Hz1000).unwrap();
+        let writes = transport.output_writes.borrow();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].0, HIDPP_SHORT_ID);
+        assert_eq!(
+            writes[0].1,
+            vec![HIDPP_DEVICE_INDEX, 0, 0x0D, 0x80, 0x60, 0]
+        );
+        assert_eq!(writes[1].1, vec![0xFF, 0x0A, 0x2E, 0x01, 0, 0]);
+    }
+
+    #[test]
+    fn simulated_logitech_battery_discovers_unified_feature() {
+        let mut battery_feature = vec![0; HIDPP_LONG_PAYLOAD_LEN];
+        battery_feature[0] = HIDPP_DEVICE_INDEX;
+        battery_feature[1] = HIDPP_ROOT_FEATURE_INDEX;
+        battery_feature[3] = 0x07;
+        let mut battery_response = vec![0; HIDPP_LONG_PAYLOAD_LEN];
+        battery_response[0] = HIDPP_DEVICE_INDEX;
+        battery_response[1] = 0x07;
+        battery_response[3] = 84;
+        battery_response[5] = 1;
+        let transport = ScriptedTransport {
+            feature_reads: RefCell::new(VecDeque::new()),
+            feature_writes: RefCell::new(Vec::new()),
+            input_reads: RefCell::new(VecDeque::from([battery_feature, battery_response])),
+            output_writes: RefCell::new(Vec::new()),
+        };
+        let protocol = ProtocolDevice::new(
+            &transport,
+            &LOGITECH_TEST_MODEL,
+            ConnectionKind::Wired,
+            ProtocolKind::LogitechHidpp,
+        );
+
+        let battery = protocol.read_battery().unwrap();
+        assert_eq!(battery.level_percent, Some(84));
+        assert_eq!(battery.charge_state, crate::devices::ChargeState::Charging);
+        let writes = transport.output_writes.borrow();
+        assert_eq!(writes.len(), 3);
+        assert_eq!(
+            writes[0].1,
+            vec![HIDPP_DEVICE_INDEX, 0, 0x0D, 0x10, 0x04, 0]
+        );
+        assert_eq!(writes[1].1, vec![HIDPP_DEVICE_INDEX, 0x07, 0x1D, 0, 0, 0]);
+        assert_eq!(writes[2].1, vec![HIDPP_DEVICE_INDEX, 0x07, 0x1D, 0, 0, 0]);
     }
 }

@@ -169,7 +169,7 @@ impl HidPollMonitor {
             for protocol in model.protocol_candidates() {
                 if let Ok(device) = info.open_device(&self.api) {
                     let live = PollingDevice::new(device, model, connection, protocol);
-                    if live.read_rate().is_ok() {
+                    if self.probe_control_interface(&live).is_ok() {
                         return Ok(live);
                     }
                 }
@@ -194,8 +194,8 @@ impl HidPollMonitor {
                     .open_device(&self.api)
                     .with_context(|| format!("failed to open {:04x}:{:04x}", vid, pid))?;
                 let live = PollingDevice::new(device, model, connection, protocol);
-                match live.read_rate() {
-                    Ok(_) => return Ok(live),
+                match self.probe_control_interface(&live) {
+                    Ok(()) => return Ok(live),
                     Err(err) => last_error = Some(format!("{protocol}: {err}")),
                 }
             }
@@ -231,18 +231,53 @@ impl HidPollMonitor {
                 }
             };
             let live = PollingDevice::new(device, model, connection, protocol);
-            match live.read_rate() {
-                Ok(rate) => {
-                    let battery = self.probe_battery(&live);
+            if live.supports_rate_read() {
+                match live.read_rate() {
+                    Ok(rate) => {
+                        let battery = self.probe_battery(&live);
+                        return DeviceProbe {
+                            protocol,
+                            current_rate: Some(rate),
+                            battery: battery.battery,
+                            battery_error: battery.error,
+                            read_error: None,
+                        };
+                    }
+                    Err(err) => {
+                        let read_error = err.to_string();
+                        let battery = self.probe_battery(&live);
+                        if battery.battery.is_some() {
+                            return DeviceProbe {
+                                protocol,
+                                current_rate: None,
+                                battery: battery.battery,
+                                battery_error: battery.error,
+                                read_error: Some(read_error),
+                            };
+                        }
+                        errors.push(format!(
+                            "{protocol}: {read_error}; battery: {}",
+                            battery.error.unwrap_or_else(|| "not available".to_string())
+                        ));
+                    }
+                }
+            } else {
+                let battery = self.probe_battery(&live);
+                if battery.battery.is_some() {
                     return DeviceProbe {
                         protocol,
-                        current_rate: Some(rate),
+                        current_rate: None,
                         battery: battery.battery,
                         battery_error: battery.error,
                         read_error: None,
                     };
                 }
-                Err(err) => errors.push(format!("{protocol}: {err}")),
+                errors.push(format!(
+                    "{protocol}: {}",
+                    battery
+                        .error
+                        .unwrap_or_else(|| "device did not answer protocol probe".to_string())
+                ));
             }
         }
 
@@ -266,6 +301,10 @@ impl HidPollMonitor {
                 error: Some(err.to_string()),
             },
         }
+    }
+
+    fn probe_control_interface(&self, live: &PollingDevice) -> Result<()> {
+        live.probe_control()
     }
 }
 
@@ -300,6 +339,7 @@ fn merge_snapshot(devices: &mut Vec<DeviceSnapshot>, snapshot: DeviceSnapshot) {
     } else if existing.battery.is_none() && snapshot.battery.is_some() {
         existing.battery = snapshot.battery;
         existing.battery_error = None;
+        existing.read_error = snapshot.read_error;
     } else if existing.battery.is_none() && existing.battery_error.is_none() {
         existing.battery_error = snapshot.battery_error;
     }
@@ -337,6 +377,14 @@ impl PollingDevice {
 
     pub fn protocol(&self) -> ProtocolKind {
         self.protocol
+    }
+
+    pub fn supports_rate_read(&self) -> bool {
+        self.protocol.supports_rate_read()
+    }
+
+    pub fn probe_control(&self) -> Result<()> {
+        self.protocol_device().probe_control()
     }
 
     pub fn read_rate(&self) -> Result<PollingRate> {
@@ -453,6 +501,21 @@ mod tests {
 
         assert_eq!(sleeping[0].current_rate, Some(PollingRate::Hz4000));
         assert_eq!(sleeping[0].battery, Some(BatteryStatus::level_only(70)));
+    }
+
+    #[test]
+    fn merge_snapshot_promotes_battery_only_control_interface() {
+        let mut devices = Vec::new();
+        let mut dead_interface = test_snapshot(None, None);
+        dead_interface.read_error = Some("wrong interface".to_string());
+        merge_snapshot(&mut devices, dead_interface);
+
+        let live_interface = test_snapshot(None, Some(BatteryStatus::level_only(88)));
+        merge_snapshot(&mut devices, live_interface);
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].battery, Some(BatteryStatus::level_only(88)));
+        assert_eq!(devices[0].read_error, None);
     }
 
     fn test_snapshot(

@@ -8,6 +8,8 @@ use serde::{
 
 pub const GWOLVES_VENDOR_ID: u16 = 0x33E4;
 pub const IPI_VENDOR_ID: u16 = 0x372E;
+pub const LOGITECH_VENDOR_ID: u16 = 0x046D;
+pub const RAZER_VENDOR_ID: u16 = 0x1532;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum PollingRate {
@@ -186,6 +188,35 @@ impl PollingRate {
             _ => None,
         }
     }
+
+    pub const fn logitech_hidpp_code(self) -> Option<u8> {
+        match self {
+            Self::Hz1000 => Some(0x01),
+            Self::Hz500 => Some(0x02),
+            Self::Hz250 => Some(0x04),
+            Self::Hz125 => Some(0x08),
+            Self::Hz2000 | Self::Hz4000 | Self::Hz8000 => None,
+        }
+    }
+
+    pub const fn razer_v1_mask(self, reversed: bool) -> u8 {
+        match (self, reversed) {
+            (Self::Hz125, false) => 0x01,
+            (Self::Hz250, false) => 0x02,
+            (Self::Hz500, false) => 0x04,
+            (Self::Hz1000, false) => 0x08,
+            (Self::Hz2000, false) => 0x10,
+            (Self::Hz4000, false) => 0x20,
+            (Self::Hz8000, false) => 0x40,
+            (Self::Hz125, true) => 0x40,
+            (Self::Hz250, true) => 0x20,
+            (Self::Hz500, true) => 0x10,
+            (Self::Hz1000, true) => 0x08,
+            (Self::Hz2000, true) => 0x04,
+            (Self::Hz4000, true) => 0x02,
+            (Self::Hz8000, true) => 0x01,
+        }
+    }
 }
 
 pub const fn gwolves_charge_state_from_status(status: u8) -> ChargeState {
@@ -286,6 +317,11 @@ pub enum ProtocolKind {
     IpiPixV1 {
         report_id: u8,
     },
+    LogitechHidpp,
+    RazerV1 {
+        tx_id: u8,
+        polling_reversed: bool,
+    },
 }
 
 impl ProtocolKind {
@@ -294,6 +330,13 @@ impl ProtocolKind {
             Self::Feature64 { .. } => rate.feature64_code(),
             Self::Eeprom16 => rate.eeprom16_code(),
             Self::IpiPixV1 { .. } => rate.ipi_pix_v1_code(),
+            Self::LogitechHidpp => match rate.logitech_hidpp_code() {
+                Some(code) => code,
+                None => 0,
+            },
+            Self::RazerV1 {
+                polling_reversed, ..
+            } => rate.razer_v1_mask(polling_reversed),
         }
     }
 
@@ -302,6 +345,14 @@ impl ProtocolKind {
             Self::Feature64 { .. } => PollingRate::from_feature64_code(code),
             Self::Eeprom16 => PollingRate::from_eeprom16_code(code),
             Self::IpiPixV1 { .. } => PollingRate::from_ipi_pix_v1_code(code),
+            Self::LogitechHidpp | Self::RazerV1 { .. } => None,
+        }
+    }
+
+    pub const fn supports_rate_read(self) -> bool {
+        match self {
+            Self::Feature64 { .. } | Self::Eeprom16 | Self::IpiPixV1 { .. } => true,
+            Self::LogitechHidpp | Self::RazerV1 { .. } => false,
         }
     }
 }
@@ -318,6 +369,15 @@ impl fmt::Display for ProtocolKind {
             } => write!(f, "feature64 old"),
             Self::Eeprom16 => write!(f, "report8 eeprom"),
             Self::IpiPixV1 { .. } => write!(f, "ipi pix v1"),
+            Self::LogitechHidpp => write!(f, "logitech hid++"),
+            Self::RazerV1 {
+                polling_reversed: true,
+                ..
+            } => write!(f, "razer v1 reversed"),
+            Self::RazerV1 {
+                polling_reversed: false,
+                ..
+            } => write!(f, "razer v1"),
         }
     }
 }
@@ -558,10 +618,262 @@ pub const IPI_PIAO_MODELS: &[ModelInfo] = &[
     },
 ];
 
+pub const LOGITECH_MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        vendor_name: "Logitech",
+        name: "Lightspeed Receiver",
+        vid: LOGITECH_VENDOR_ID,
+        wired_pid: None,
+        wireless_pid: None,
+        receiver_pid: Some(0xC547),
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::LogitechHidpp,
+        wired_rates: RATES_1K,
+        wireless_rates: RATES_1K,
+        receiver_rates: RATES_1K,
+    },
+    ModelInfo {
+        vendor_name: "Logitech",
+        name: "PRO X SUPERLIGHT",
+        vid: LOGITECH_VENDOR_ID,
+        wired_pid: Some(0xC094),
+        wireless_pid: None,
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::LogitechHidpp,
+        wired_rates: RATES_1K,
+        wireless_rates: RATES_1K,
+        receiver_rates: RATES_1K,
+    },
+    ModelInfo {
+        vendor_name: "Logitech",
+        name: "PRO X SUPERLIGHT 2",
+        vid: LOGITECH_VENDOR_ID,
+        wired_pid: Some(0xC09B),
+        wireless_pid: None,
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::LogitechHidpp,
+        wired_rates: RATES_1K,
+        wireless_rates: RATES_1K,
+        receiver_rates: RATES_1K,
+    },
+    ModelInfo {
+        vendor_name: "Logitech",
+        name: "PRO X Superlight Wireless",
+        vid: LOGITECH_VENDOR_ID,
+        wired_pid: None,
+        wireless_pid: Some(0x4093),
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::LogitechHidpp,
+        wired_rates: RATES_1K,
+        wireless_rates: RATES_1K,
+        receiver_rates: RATES_1K,
+    },
+];
+
+pub const RAZER_MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        vendor_name: "Razer",
+        name: "Viper V3 Pro",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: Some(0x00C0),
+        wireless_pid: Some(0x00C1),
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0x1F,
+            polling_reversed: true,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "Razer",
+        name: "Viper V3 HyperSpeed",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: Some(0x00B6),
+        wireless_pid: Some(0x00B8),
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0x1F,
+            polling_reversed: true,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "Razer",
+        name: "Viper V2 Pro",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: Some(0x00A5),
+        wireless_pid: Some(0x00A6),
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0x1F,
+            polling_reversed: true,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "Razer",
+        name: "DeathAdder V4 Pro",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: Some(0x00BE),
+        wireless_pid: Some(0x00BF),
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0x1F,
+            polling_reversed: true,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "Razer",
+        name: "DeathAdder V3",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: Some(0x0090),
+        wireless_pid: None,
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0x1F,
+            polling_reversed: true,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "Razer",
+        name: "DeathAdder V3 Pro",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: None,
+        wireless_pid: Some(0x0092),
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0x1F,
+            polling_reversed: true,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "Razer",
+        name: "DeathAdder V2",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: Some(0x007A),
+        wireless_pid: None,
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0xFF,
+            polling_reversed: false,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "Razer",
+        name: "DeathAdder V2 Pro",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: None,
+        wireless_pid: Some(0x007C),
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0x3F,
+            polling_reversed: false,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "Razer",
+        name: "Basilisk V3",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: Some(0x0099),
+        wireless_pid: None,
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0x1F,
+            polling_reversed: true,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "Razer",
+        name: "Basilisk V3 Pro",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: None,
+        wireless_pid: Some(0x008E),
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0x1F,
+            polling_reversed: true,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "Razer",
+        name: "Basilisk Ultimate",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: None,
+        wireless_pid: Some(0x0078),
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0x1F,
+            polling_reversed: false,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
+        vendor_name: "Razer",
+        name: "Naga X",
+        vid: RAZER_VENDOR_ID,
+        wired_pid: Some(0x0086),
+        wireless_pid: None,
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::RazerV1 {
+            tx_id: 0x1F,
+            polling_reversed: false,
+        },
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+];
+
 pub fn find_model(vid: u16, pid: u16) -> Option<(&'static ModelInfo, ConnectionKind)> {
     FENRIR_MODELS
         .iter()
         .chain(IPI_PIAO_MODELS)
+        .chain(LOGITECH_MODELS)
+        .chain(RAZER_MODELS)
         .find_map(|model| {
             model
                 .match_connection(vid, pid)
@@ -606,6 +918,7 @@ pub fn build_feature64_get_rate(
         }
         ProtocolKind::Eeprom16 => {}
         ProtocolKind::IpiPixV1 { .. } => {}
+        ProtocolKind::LogitechHidpp | ProtocolKind::RazerV1 { .. } => {}
     }
     report
 }
@@ -643,6 +956,7 @@ pub fn build_feature64_set_rate(
         }
         ProtocolKind::Eeprom16 => {}
         ProtocolKind::IpiPixV1 { .. } => {}
+        ProtocolKind::LogitechHidpp | ProtocolKind::RazerV1 { .. } => {}
     }
     report
 }
@@ -668,7 +982,10 @@ pub fn build_feature64_get_battery(protocol: ProtocolKind, connection: Connectio
                 report[3] = 1;
             }
         }
-        ProtocolKind::Eeprom16 | ProtocolKind::IpiPixV1 { .. } => {}
+        ProtocolKind::Eeprom16
+        | ProtocolKind::IpiPixV1 { .. }
+        | ProtocolKind::LogitechHidpp
+        | ProtocolKind::RazerV1 { .. } => {}
     }
     report
 }
@@ -788,6 +1105,24 @@ mod tests {
     }
 
     #[test]
+    fn maps_logitech_hidpp_rate_codes() {
+        assert_eq!(PollingRate::Hz1000.logitech_hidpp_code(), Some(0x01));
+        assert_eq!(PollingRate::Hz500.logitech_hidpp_code(), Some(0x02));
+        assert_eq!(PollingRate::Hz250.logitech_hidpp_code(), Some(0x04));
+        assert_eq!(PollingRate::Hz125.logitech_hidpp_code(), Some(0x08));
+        assert_eq!(PollingRate::Hz4000.logitech_hidpp_code(), None);
+    }
+
+    #[test]
+    fn maps_razer_v1_polling_masks() {
+        assert_eq!(PollingRate::Hz125.razer_v1_mask(false), 0x01);
+        assert_eq!(PollingRate::Hz8000.razer_v1_mask(false), 0x40);
+        assert_eq!(PollingRate::Hz125.razer_v1_mask(true), 0x40);
+        assert_eq!(PollingRate::Hz8000.razer_v1_mask(true), 0x01);
+        assert_eq!(PollingRate::Hz1000.razer_v1_mask(true), 0x08);
+    }
+
+    #[test]
     fn finds_fenrir_models() {
         let (model, connection) = find_model(GWOLVES_VENDOR_ID, 0x3854).unwrap();
         assert_eq!(model.name, "Fenrir Pro");
@@ -804,6 +1139,43 @@ mod tests {
         assert_eq!(model.vendor_name, "IPI");
         assert_eq!(model.name, "Piao");
         assert_eq!(connection, ConnectionKind::Wireless);
+    }
+
+    #[test]
+    fn finds_logitech_models() {
+        let (model, connection) = find_model(LOGITECH_VENDOR_ID, 0xC547).unwrap();
+        assert_eq!(model.name, "Lightspeed Receiver");
+        assert_eq!(connection, ConnectionKind::Receiver);
+        assert_eq!(model.protocol, ProtocolKind::LogitechHidpp);
+
+        let (model, connection) = find_model(LOGITECH_VENDOR_ID, 0xC09B).unwrap();
+        assert_eq!(model.name, "PRO X SUPERLIGHT 2");
+        assert_eq!(connection, ConnectionKind::Wired);
+    }
+
+    #[test]
+    fn finds_razer_models() {
+        let (model, connection) = find_model(RAZER_VENDOR_ID, 0x00C1).unwrap();
+        assert_eq!(model.name, "Viper V3 Pro");
+        assert_eq!(connection, ConnectionKind::Wireless);
+        assert_eq!(
+            model.protocol,
+            ProtocolKind::RazerV1 {
+                tx_id: 0x1F,
+                polling_reversed: true
+            }
+        );
+
+        let (model, connection) = find_model(RAZER_VENDOR_ID, 0x007C).unwrap();
+        assert_eq!(model.name, "DeathAdder V2 Pro");
+        assert_eq!(connection, ConnectionKind::Wireless);
+        assert_eq!(
+            model.protocol,
+            ProtocolKind::RazerV1 {
+                tx_id: 0x3F,
+                polling_reversed: false
+            }
+        );
     }
 
     #[test]
