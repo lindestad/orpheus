@@ -48,6 +48,14 @@ List supported devices, current configured polling rates, and battery telemetry:
 
 ```powershell
 cargo run -- list
+cargo run -- list --json
+```
+
+Probe every supported HID interface and print read-only protocol diagnostics:
+
+```powershell
+cargo run -- diagnose
+cargo run -- diagnose --json
 ```
 
 Set the first supported device to a rate:

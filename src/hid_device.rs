@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use anyhow::{Context, Result, anyhow};
 use hidapi::{HidApi, HidDevice};
@@ -159,6 +162,76 @@ impl HidPollMonitor {
         Ok(devices)
     }
 
+    pub fn diagnose(&self) -> Vec<DeviceDiagnostic> {
+        let mut diagnostics = Vec::new();
+        for info in self.api.device_list() {
+            let vid = info.vendor_id();
+            let pid = info.product_id();
+            let Some((model, connection)) = find_model(vid, pid) else {
+                continue;
+            };
+
+            let mut protocol_results = Vec::new();
+            for protocol in model.protocol_candidates() {
+                let started = Instant::now();
+                let device = match info.open_device(&self.api) {
+                    Ok(device) => device,
+                    Err(err) => {
+                        protocol_results.push(ProtocolDiagnostic {
+                            protocol,
+                            open: ProbeOutcome::error_timed(err.to_string(), started),
+                            control_probe: ProbeOutcome::skipped("open failed"),
+                            rate_read: ProbeOutcome::skipped("open failed"),
+                            battery_read: ProbeOutcome::skipped("open failed"),
+                        });
+                        continue;
+                    }
+                };
+
+                let live = PollingDevice::new(device, model, connection, protocol);
+                let control_probe = timed_probe(|| {
+                    live.probe_control()?;
+                    Ok("control interface answered".to_string())
+                });
+                let rate_read = if live.supports_rate_read() {
+                    timed_probe(|| live.read_rate().map(|rate| rate.to_string()))
+                } else {
+                    ProbeOutcome::skipped("protocol does not support current-rate read")
+                };
+                let battery_read =
+                    timed_probe(|| live.read_battery().map(|battery| battery.to_string()));
+
+                protocol_results.push(ProtocolDiagnostic {
+                    protocol,
+                    open: ProbeOutcome::ok_timed("opened", started),
+                    control_probe,
+                    rate_read,
+                    battery_read,
+                });
+            }
+
+            diagnostics.push(DeviceDiagnostic {
+                path: info.path().to_string_lossy().into_owned(),
+                vid,
+                pid,
+                manufacturer: info.manufacturer_string().map(ToOwned::to_owned),
+                product: info.product_string().map(ToOwned::to_owned),
+                serial: info.serial_number().map(ToOwned::to_owned),
+                release_number: info.release_number(),
+                usage_page: device_usage_page(info),
+                usage: device_usage(info),
+                interface_number: info.interface_number(),
+                bus_type: format!("{:?}", info.bus_type()),
+                vendor_name: model.vendor_name,
+                model_name: model.name,
+                connection,
+                supported_rates: model.supported_rates(connection).to_vec(),
+                protocols: protocol_results,
+            });
+        }
+        diagnostics
+    }
+
     pub fn open_first_supported(&self) -> Result<PollingDevice> {
         for info in self.api.device_list() {
             let vid = info.vendor_id();
@@ -305,6 +378,132 @@ impl HidPollMonitor {
 
     fn probe_control_interface(&self, live: &PollingDevice) -> Result<()> {
         live.probe_control()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DeviceDiagnostic {
+    pub path: String,
+    pub vid: u16,
+    pub pid: u16,
+    pub manufacturer: Option<String>,
+    pub product: Option<String>,
+    pub serial: Option<String>,
+    pub release_number: u16,
+    pub usage_page: Option<u16>,
+    pub usage: Option<u16>,
+    pub interface_number: i32,
+    pub bus_type: String,
+    pub vendor_name: &'static str,
+    pub model_name: &'static str,
+    pub connection: ConnectionKind,
+    pub supported_rates: Vec<PollingRate>,
+    pub protocols: Vec<ProtocolDiagnostic>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProtocolDiagnostic {
+    pub protocol: ProtocolKind,
+    pub open: ProbeOutcome,
+    pub control_probe: ProbeOutcome,
+    pub rate_read: ProbeOutcome,
+    pub battery_read: ProbeOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProbeOutcome {
+    Ok { detail: String, elapsed_ms: u128 },
+    Skipped { reason: String },
+    Error { error: String, elapsed_ms: u128 },
+}
+
+impl ProbeOutcome {
+    pub fn ok_timed(detail: impl Into<String>, started: Instant) -> Self {
+        Self::Ok {
+            detail: detail.into(),
+            elapsed_ms: started.elapsed().as_millis(),
+        }
+    }
+
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        Self::Skipped {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn error_timed(error: impl Into<String>, started: Instant) -> Self {
+        Self::Error {
+            error: error.into(),
+            elapsed_ms: started.elapsed().as_millis(),
+        }
+    }
+
+    pub const fn status(&self) -> &'static str {
+        match self {
+            Self::Ok { .. } => "ok",
+            Self::Skipped { .. } => "skipped",
+            Self::Error { .. } => "error",
+        }
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Ok { detail, .. } => Some(detail),
+            Self::Skipped { .. } | Self::Error { .. } => None,
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Skipped { reason } => Some(reason),
+            Self::Ok { .. } | Self::Error { .. } => None,
+        }
+    }
+
+    pub fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Error { error, .. } => Some(error),
+            Self::Ok { .. } | Self::Skipped { .. } => None,
+        }
+    }
+
+    pub const fn elapsed_ms(&self) -> Option<u128> {
+        match self {
+            Self::Ok { elapsed_ms, .. } | Self::Error { elapsed_ms, .. } => Some(*elapsed_ms),
+            Self::Skipped { .. } => None,
+        }
+    }
+}
+
+fn timed_probe(probe: impl FnOnce() -> Result<String>) -> ProbeOutcome {
+    let started = Instant::now();
+    match probe() {
+        Ok(detail) => ProbeOutcome::ok_timed(detail, started),
+        Err(err) => ProbeOutcome::error_timed(err.to_string(), started),
+    }
+}
+
+fn device_usage_page(info: &hidapi::DeviceInfo) -> Option<u16> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = info;
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(info.usage_page())
+    }
+}
+
+fn device_usage(info: &hidapi::DeviceInfo) -> Option<u16> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = info;
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(info.usage())
     }
 }
 

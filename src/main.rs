@@ -1,15 +1,16 @@
-use std::{path::PathBuf, str::FromStr, thread, time::Duration};
+use std::{io, path::PathBuf, str::FromStr, thread, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use orpheus::{
     config::{PollMonitorConfig, default_config_path},
-    devices::{PollingRate, format_supported_rates},
+    devices::{BatteryStatus, PollingRate, format_supported_rates},
     gui::{GuiOptions, run_gui},
-    hid_device::HidPollMonitor,
+    hid_device::{DeviceDiagnostic, DeviceSnapshot, HidPollMonitor, ProbeOutcome},
     tui::run_tui,
     watcher::run_watch,
 };
+use serde::Serialize;
 
 #[derive(Debug, Parser)]
 #[command(name = "orpheus")]
@@ -33,7 +34,17 @@ enum Command {
     /// Launch the interactive terminal UI.
     Tui,
     /// List supported devices and their current configured rate.
-    List,
+    List {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Probe supported HID interfaces and print read-only protocol diagnostics.
+    Diagnose {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Set the first supported device to a polling rate, e.g. 1000 or 8k.
     Set { rate: String },
     /// Write an example app-rule config file.
@@ -63,7 +74,8 @@ fn main() -> Result<()> {
             steady_repaint,
         }),
         Command::Tui => run_tui(),
-        Command::List => list_devices(),
+        Command::List { json } => list_devices(json),
+        Command::Diagnose { json } => diagnose_devices(json),
         Command::Set { rate } => set_rate(&rate),
         Command::InitConfig { path } => init_config(path),
         Command::Watch {
@@ -74,9 +86,16 @@ fn main() -> Result<()> {
     }
 }
 
-fn list_devices() -> Result<()> {
+fn list_devices(json: bool) -> Result<()> {
     let monitor = HidPollMonitor::new()?;
     let devices = monitor.scan()?;
+    if json {
+        write_json(&ListJson {
+            devices: devices.iter().map(ListDeviceJson::from_snapshot).collect(),
+        })?;
+        return Ok(());
+    }
+
     if devices.is_empty() {
         println!("no supported polling-rate devices found");
         return Ok(());
@@ -104,6 +123,30 @@ fn list_devices() -> Result<()> {
         if let Some(error) = device.battery_error {
             println!("  battery error: {error}");
         }
+    }
+    Ok(())
+}
+
+fn diagnose_devices(json: bool) -> Result<()> {
+    let monitor = HidPollMonitor::new()?;
+    let diagnostics = monitor.diagnose();
+    if json {
+        write_json(&DiagnoseJson {
+            interfaces: diagnostics
+                .iter()
+                .map(DiagnoseInterfaceJson::from_diagnostic)
+                .collect(),
+        })?;
+        return Ok(());
+    }
+
+    if diagnostics.is_empty() {
+        println!("no supported HID interfaces found");
+        return Ok(());
+    }
+
+    for device in diagnostics {
+        print_diagnostic(&device);
     }
     Ok(())
 }
@@ -146,4 +189,225 @@ fn watch(path: PathBuf, dry_run: bool, once: bool) -> Result<()> {
         config.scan_interval_ms.max(250)
     );
     run_watch(config, dry_run, once)
+}
+
+fn write_json<T: Serialize>(value: &T) -> Result<()> {
+    serde_json::to_writer_pretty(io::stdout(), value)?;
+    println!();
+    Ok(())
+}
+
+fn print_diagnostic(device: &DeviceDiagnostic) {
+    println!(
+        "{:04x}:{:04x} iface {} usage {}:{} {} {} {}",
+        device.vid,
+        device.pid,
+        device.interface_number,
+        optional_hex(device.usage_page),
+        optional_hex(device.usage),
+        device.vendor_name,
+        device.model_name,
+        device.connection
+    );
+    println!("  path: {}", device.path);
+    if let Some(product) = &device.product {
+        println!("  product: {product}");
+    }
+    if let Some(manufacturer) = &device.manufacturer {
+        println!("  manufacturer: {manufacturer}");
+    }
+    if let Some(serial) = &device.serial {
+        println!("  serial: {serial}");
+    }
+    println!(
+        "  release: 0x{:04x} bus: {} supported: {}",
+        device.release_number,
+        device.bus_type,
+        format_supported_rates(&device.supported_rates)
+    );
+
+    for protocol in &device.protocols {
+        println!("  protocol {}", protocol.protocol);
+        print_probe("open", &protocol.open);
+        print_probe("control", &protocol.control_probe);
+        print_probe("rate", &protocol.rate_read);
+        print_probe("battery", &protocol.battery_read);
+    }
+}
+
+fn print_probe(label: &str, outcome: &ProbeOutcome) {
+    match outcome {
+        ProbeOutcome::Ok { detail, elapsed_ms } => {
+            println!("    {label}: ok ({detail}, {elapsed_ms} ms)")
+        }
+        ProbeOutcome::Skipped { reason } => println!("    {label}: skipped ({reason})"),
+        ProbeOutcome::Error { error, elapsed_ms } => {
+            println!("    {label}: error ({error}, {elapsed_ms} ms)")
+        }
+    }
+}
+
+fn optional_hex(value: Option<u16>) -> String {
+    value
+        .map(|value| format!("0x{value:04x}"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[derive(Serialize)]
+struct ListJson {
+    devices: Vec<ListDeviceJson>,
+}
+
+#[derive(Serialize)]
+struct ListDeviceJson {
+    path: String,
+    vid: u16,
+    pid: u16,
+    product_name: Option<String>,
+    vendor_name: &'static str,
+    model_name: &'static str,
+    connection: String,
+    protocol: String,
+    supported_rates: Vec<u16>,
+    current_rate: Option<u16>,
+    cached_rate: bool,
+    battery: Option<BatteryJson>,
+    cached_battery: bool,
+    read_error: Option<String>,
+    battery_error: Option<String>,
+}
+
+impl ListDeviceJson {
+    fn from_snapshot(device: &DeviceSnapshot) -> Self {
+        Self {
+            path: device.path.clone(),
+            vid: device.vid,
+            pid: device.pid,
+            product_name: device.product_name.clone(),
+            vendor_name: device.vendor_name,
+            model_name: device.model_name,
+            connection: device.connection.to_string(),
+            protocol: device.protocol.to_string(),
+            supported_rates: rates_hz(&device.supported_rates),
+            current_rate: device.current_rate.map(PollingRate::hz),
+            cached_rate: device.cached_rate,
+            battery: device.battery.map(BatteryJson::from_status),
+            cached_battery: device.cached_battery,
+            read_error: device.read_error.clone(),
+            battery_error: device.battery_error.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BatteryJson {
+    level_percent: Option<u8>,
+    charge_state: String,
+    raw_state: Option<u8>,
+    charging_like: Option<bool>,
+    text: String,
+}
+
+impl BatteryJson {
+    fn from_status(battery: BatteryStatus) -> Self {
+        Self {
+            level_percent: battery.level_percent,
+            charge_state: battery.charge_state.to_string(),
+            raw_state: battery.raw_state,
+            charging_like: battery.is_charging_like(),
+            text: battery.to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DiagnoseJson {
+    interfaces: Vec<DiagnoseInterfaceJson>,
+}
+
+#[derive(Serialize)]
+struct DiagnoseInterfaceJson {
+    path: String,
+    vid: u16,
+    pid: u16,
+    manufacturer: Option<String>,
+    product: Option<String>,
+    serial: Option<String>,
+    release_number: u16,
+    usage_page: Option<u16>,
+    usage: Option<u16>,
+    interface_number: i32,
+    bus_type: String,
+    vendor_name: &'static str,
+    model_name: &'static str,
+    connection: String,
+    supported_rates: Vec<u16>,
+    protocols: Vec<DiagnoseProtocolJson>,
+}
+
+impl DiagnoseInterfaceJson {
+    fn from_diagnostic(device: &DeviceDiagnostic) -> Self {
+        Self {
+            path: device.path.clone(),
+            vid: device.vid,
+            pid: device.pid,
+            manufacturer: device.manufacturer.clone(),
+            product: device.product.clone(),
+            serial: device.serial.clone(),
+            release_number: device.release_number,
+            usage_page: device.usage_page,
+            usage: device.usage,
+            interface_number: device.interface_number,
+            bus_type: device.bus_type.clone(),
+            vendor_name: device.vendor_name,
+            model_name: device.model_name,
+            connection: device.connection.to_string(),
+            supported_rates: rates_hz(&device.supported_rates),
+            protocols: device
+                .protocols
+                .iter()
+                .map(|protocol| DiagnoseProtocolJson {
+                    protocol: protocol.protocol.to_string(),
+                    open: ProbeJson::from_outcome(&protocol.open),
+                    control_probe: ProbeJson::from_outcome(&protocol.control_probe),
+                    rate_read: ProbeJson::from_outcome(&protocol.rate_read),
+                    battery_read: ProbeJson::from_outcome(&protocol.battery_read),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DiagnoseProtocolJson {
+    protocol: String,
+    open: ProbeJson,
+    control_probe: ProbeJson,
+    rate_read: ProbeJson,
+    battery_read: ProbeJson,
+}
+
+#[derive(Serialize)]
+struct ProbeJson {
+    status: &'static str,
+    detail: Option<String>,
+    reason: Option<String>,
+    error: Option<String>,
+    elapsed_ms: Option<u128>,
+}
+
+impl ProbeJson {
+    fn from_outcome(outcome: &ProbeOutcome) -> Self {
+        Self {
+            status: outcome.status(),
+            detail: outcome.detail().map(ToOwned::to_owned),
+            reason: outcome.reason().map(ToOwned::to_owned),
+            error: outcome.error_message().map(ToOwned::to_owned),
+            elapsed_ms: outcome.elapsed_ms(),
+        }
+    }
+}
+
+fn rates_hz(rates: &[PollingRate]) -> Vec<u16> {
+    rates.iter().map(|rate| rate.hz()).collect()
 }
