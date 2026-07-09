@@ -20,7 +20,7 @@ use ratatui::{
 
 use crate::{
     devices::{BatteryStatus, ChargeState, ConnectionKind, PollingRate},
-    hid_device::{DeviceSnapshot, DeviceSnapshotCache, HidPollMonitor},
+    hid_device::{DeviceSnapshot, DeviceSnapshotCache, HidAccessCandidate, HidPollMonitor},
 };
 
 const FOCUSED_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
@@ -70,6 +70,17 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
+                    if app.access_prompt.is_some() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Enter => {
+                                enable_hid_access(terminal, &mut app, &monitor)?;
+                            }
+                            KeyCode::Char('n') | KeyCode::Esc => app.dismiss_access_prompt(),
+                            KeyCode::Char('q') => break,
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('r') => app.refresh(&monitor),
@@ -101,6 +112,8 @@ struct TuiApp {
     focused: bool,
     status: String,
     last_refresh: Instant,
+    access_prompt: Option<AccessPrompt>,
+    access_prompt_dismissed: bool,
 }
 
 impl TuiApp {
@@ -115,6 +128,8 @@ impl TuiApp {
             focused: true,
             status: "scanning".to_string(),
             last_refresh: Instant::now() - FOCUSED_REFRESH_INTERVAL,
+            access_prompt: None,
+            access_prompt_dismissed: false,
         }
     }
 
@@ -152,6 +167,7 @@ impl TuiApp {
                 } else {
                     format!("{} device(s), refreshed now", self.devices.len())
                 };
+                self.refresh_access_prompt(monitor);
                 self.try_pending_rate(monitor);
             }
             Err(err) => {
@@ -159,6 +175,24 @@ impl TuiApp {
                 self.status = format!("scan failed: {err}");
             }
         }
+    }
+
+    fn refresh_access_prompt(&mut self, monitor: &HidPollMonitor) {
+        if self.access_prompt.is_some() || self.access_prompt_dismissed {
+            return;
+        }
+        let candidates = monitor.hid_access_candidates();
+        if candidates.is_empty() {
+            return;
+        }
+        self.status = format!("{} supported hidraw path(s) need access", candidates.len());
+        self.access_prompt = Some(AccessPrompt { candidates });
+    }
+
+    fn dismiss_access_prompt(&mut self) {
+        self.access_prompt = None;
+        self.access_prompt_dismissed = true;
+        self.status = "hidraw access setup skipped".to_string();
     }
 
     fn selected_device(&self) -> Option<&DeviceSnapshot> {
@@ -373,6 +407,174 @@ impl TuiApp {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct AccessPrompt {
+    candidates: Vec<HidAccessCandidate>,
+}
+
+fn enable_hid_access(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut TuiApp,
+    monitor: &HidPollMonitor,
+) -> Result<()> {
+    let Some(prompt) = app.access_prompt.clone() else {
+        return Ok(());
+    };
+
+    match run_hid_access_setup(terminal, &prompt.candidates) {
+        Ok(message) => {
+            app.access_prompt = None;
+            app.access_prompt_dismissed = false;
+            app.refresh(monitor);
+            app.status = message;
+        }
+        Err(err) => {
+            app.status = format!("hidraw access setup failed: {err:#}");
+        }
+    }
+    Ok(())
+}
+
+fn run_hid_access_setup(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    candidates: &[HidAccessCandidate],
+) -> Result<String> {
+    suspend_terminal(terminal, || {
+        #[cfg(target_os = "linux")]
+        {
+            install_linux_hid_access(candidates)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = candidates;
+            anyhow::bail!("hidraw access setup is only available on Linux")
+        }
+    })
+}
+
+fn suspend_terminal<T>(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    disable_raw_mode().ok();
+    execute!(
+        terminal.backend_mut(),
+        DisableFocusChange,
+        LeaveAlternateScreen
+    )
+    .ok();
+    terminal.show_cursor().ok();
+
+    let result = action();
+
+    println!();
+    println!("Press Enter to return to Orpheus...");
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).ok();
+
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableFocusChange
+    )
+    .ok();
+    enable_raw_mode().ok();
+    terminal.clear().ok();
+
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_hid_access(candidates: &[HidAccessCandidate]) -> Result<String> {
+    use std::{
+        collections::BTreeSet,
+        env,
+        io::Write,
+        process::{Command, Stdio},
+    };
+
+    const RULE_PATH: &str = "/etc/udev/rules.d/70-orpheus-hidraw.rules";
+
+    if candidates.is_empty() {
+        anyhow::bail!("no hidraw access candidates found")
+    }
+
+    let rules = linux_hidraw_udev_rules(candidates);
+    println!("Installing {RULE_PATH}");
+    let mut tee = Command::new("sudo")
+        .arg("tee")
+        .arg(RULE_PATH)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .context("failed to start sudo tee")?;
+    tee.stdin
+        .as_mut()
+        .context("failed to open sudo tee stdin")?
+        .write_all(rules.as_bytes())
+        .context("failed to write udev rules")?;
+    let status = tee.wait().context("failed to wait for sudo tee")?;
+    if !status.success() {
+        anyhow::bail!("sudo tee failed with {status}");
+    }
+
+    run_sudo(["udevadm", "control", "--reload-rules"])?;
+    run_sudo(["udevadm", "trigger", "--subsystem-match=hidraw"])?;
+
+    let user = env::var("USER")
+        .or_else(|_| env::var("LOGNAME"))
+        .context("failed to determine current user")?;
+    let paths = candidates
+        .iter()
+        .map(|candidate| candidate.path.as_str())
+        .collect::<BTreeSet<_>>();
+    if !paths.is_empty() {
+        let mut command = Command::new("sudo");
+        command.arg("setfacl").arg("-m").arg(format!("u:{user}:rw"));
+        for path in &paths {
+            command.arg(path);
+        }
+        let status = command.status().context("failed to start sudo setfacl")?;
+        if !status.success() {
+            anyhow::bail!("sudo setfacl failed with {status}");
+        }
+    }
+
+    let count = paths.len();
+    Ok(format!("enabled hidraw access for {count} path(s)"))
+}
+
+#[cfg(target_os = "linux")]
+fn run_sudo<const N: usize>(args: [&str; N]) -> Result<()> {
+    let status = std::process::Command::new("sudo")
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to start sudo {}", args.join(" ")))?;
+    if !status.success() {
+        anyhow::bail!("sudo {} failed with {status}", args.join(" "));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_hidraw_udev_rules(candidates: &[HidAccessCandidate]) -> String {
+    let mut pairs = std::collections::BTreeSet::new();
+    for candidate in candidates {
+        pairs.insert((candidate.vid, candidate.pid));
+    }
+
+    let mut rules = String::from(
+        "# Generated by Orpheus.\n# Grants logged-in users access to supported mouse HID control interfaces.\n",
+    );
+    for (vid, pid) in pairs {
+        rules.push_str(&format!(
+            "SUBSYSTEM==\"hidraw\", ATTRS{{idVendor}}==\"{vid:04x}\", ATTRS{{idProduct}}==\"{pid:04x}\", TAG+=\"uaccess\"\n"
+        ));
+    }
+    rules
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingTuiRateChange {
     vid: u16,
     pid: u16,
@@ -407,6 +609,9 @@ fn draw(frame: &mut Frame<'_>, app: &TuiApp) {
     draw_devices(frame, chunks[1], app);
     draw_rate_panel(frame, chunks[2], app);
     draw_footer(frame, chunks[3], app);
+    if let Some(prompt) = &app.access_prompt {
+        draw_access_prompt(frame, area, prompt);
+    }
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -579,6 +784,68 @@ fn draw_rate_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .block(Block::default().title("Rate").borders(Borders::ALL)),
         area,
     );
+}
+
+fn draw_access_prompt(frame: &mut Frame<'_>, area: Rect, prompt: &AccessPrompt) {
+    let modal = centered_rect(78, 13, area);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Linux hidraw access is needed",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::raw(
+            "Supported devices are visible, but one or more hidraw nodes could not be opened.",
+        ),
+        Line::raw("Install a narrow udev rule and apply ACLs to current nodes? This runs sudo."),
+        Line::raw(""),
+    ];
+
+    for candidate in prompt.candidates.iter().take(4) {
+        lines.push(Line::raw(format!(
+            "- {} {} {:04x}:{:04x} {}",
+            candidate.vendor_name,
+            candidate.model_name,
+            candidate.vid,
+            candidate.pid,
+            candidate.path
+        )));
+    }
+    if prompt.candidates.len() > 4 {
+        lines.push(Line::raw(format!(
+            "- ...and {} more",
+            prompt.candidates.len() - 4
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("enter/y", Style::default().fg(Color::Cyan)),
+        Span::raw(" enable  "),
+        Span::styled("n/esc", Style::default().fg(Color::Cyan)),
+        Span::raw(" skip  "),
+        Span::styled("q", Style::default().fg(Color::Cyan)),
+        Span::raw(" quit"),
+    ]));
+
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().title("Access").borders(Borders::ALL)),
+        modal,
+    );
+}
+
+fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
+    let width = area.width.saturating_mul(percent_x).saturating_div(100);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height: height.min(area.height),
+    }
 }
 
 fn power_summary(device: &DeviceSnapshot) -> String {
@@ -761,6 +1028,38 @@ mod tests {
         });
 
         assert_eq!(app.refresh_interval(), PENDING_RETRY_INTERVAL);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_hidraw_rules_are_narrow_and_deduplicated() {
+        let candidates = vec![
+            HidAccessCandidate {
+                path: "/dev/hidraw1".to_string(),
+                vid: 0x3554,
+                pid: 0xF514,
+                vendor_name: "Compx",
+                model_name: "PIAO11",
+            },
+            HidAccessCandidate {
+                path: "/dev/hidraw2".to_string(),
+                vid: 0x3554,
+                pid: 0xF514,
+                vendor_name: "Compx",
+                model_name: "PIAO11",
+            },
+        ];
+
+        let rules = linux_hidraw_udev_rules(&candidates);
+        assert_eq!(
+            rules
+                .lines()
+                .filter(|line| line.contains("3554") && line.contains("f514"))
+                .count(),
+            1
+        );
+        assert!(rules.contains("SUBSYSTEM==\"hidraw\""));
+        assert!(rules.contains("TAG+=\"uaccess\""));
     }
 
     fn test_device(battery: Option<BatteryStatus>) -> DeviceSnapshot {

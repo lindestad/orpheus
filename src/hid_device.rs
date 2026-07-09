@@ -33,6 +33,15 @@ pub struct DeviceSnapshot {
     pub read_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct HidAccessCandidate {
+    pub path: String,
+    pub vid: u16,
+    pub pid: u16,
+    pub vendor_name: &'static str,
+    pub model_name: &'static str,
+}
+
 impl DeviceSnapshot {
     pub fn supported_rates_text(&self) -> String {
         format_supported_rates(&self.supported_rates)
@@ -232,6 +241,48 @@ impl HidPollMonitor {
         diagnostics
     }
 
+    pub fn hid_access_candidates(&self) -> Vec<HidAccessCandidate> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut candidates = Vec::new();
+            let mut seen = HashSet::new();
+            for info in self.api.device_list() {
+                let vid = info.vendor_id();
+                let pid = info.product_id();
+                let Some((model, _)) = find_model(vid, pid) else {
+                    continue;
+                };
+
+                let Err(err) = info.open_device(&self.api) else {
+                    continue;
+                };
+                let error = format!("{err:#}");
+                if !is_hid_permission_error(&error) {
+                    continue;
+                }
+
+                let path = info.path().to_string_lossy().into_owned();
+                if !path.starts_with("/dev/hidraw") || !seen.insert(path.clone()) {
+                    continue;
+                }
+
+                candidates.push(HidAccessCandidate {
+                    path,
+                    vid,
+                    pid,
+                    vendor_name: model.vendor_name,
+                    model_name: model.name,
+                });
+            }
+            candidates
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            Vec::new()
+        }
+    }
+
     pub fn open_first_supported(&self) -> Result<PollingDevice> {
         for info in self.api.device_list() {
             let vid = info.vendor_id();
@@ -379,6 +430,14 @@ impl HidPollMonitor {
     fn probe_control_interface(&self, live: &PollingDevice) -> Result<()> {
         live.probe_control()
     }
+}
+
+fn is_hid_permission_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("permission denied")
+        || error.contains("access denied")
+        || error.contains("operation not permitted")
+        || error.contains("os error 13")
 }
 
 #[derive(Clone, Debug)]
