@@ -3,10 +3,14 @@ use std::{thread, time::Duration};
 use anyhow::{Result, anyhow};
 
 use crate::devices::{
-    BatteryStatus, ConnectionKind, ModelInfo, PollingRate, ProtocolKind, build_eeprom16_get_rate,
-    build_eeprom16_set_rate, build_feature64_get_battery, build_feature64_get_rate,
-    build_feature64_set_rate, build_ipi_pix_v1_get_basic_info, build_ipi_pix_v1_get_rate,
-    build_ipi_pix_v1_set_rate, gwolves_charge_state_from_status, ipi_pix_v1_rate_from_sensor_byte,
+    BatteryStatus, ConnectionKind, DpiConfig, EEPROM16_DPI_ENTRY_LEN, EEPROM16_DPI_TABLE_OFFSET,
+    EEPROM16_MAX_TRANSFER_LEN, IPI_PIX_DPI_COLOR_BYTES, IPI_PIX_DPI_LEVELS, ModelInfo, PollingRate,
+    ProtocolKind, build_eeprom16_dpi_entry, build_eeprom16_get_rate, build_eeprom16_read,
+    build_eeprom16_set_rate, build_eeprom16_write, build_feature64_get_battery,
+    build_feature64_get_rate, build_feature64_set_rate, build_ipi_pix_v1_get_basic_info,
+    build_ipi_pix_v1_get_dpi_config, build_ipi_pix_v1_get_rate, build_ipi_pix_v1_set_current_dpi,
+    build_ipi_pix_v1_set_rate, eeprom16_block_checksum, eeprom16_raw_to_dpi,
+    gwolves_charge_state_from_status, ipi_pix_v1_rate_from_sensor_byte, ipi_pix_v1_raw_to_dpi,
 };
 
 const DEFAULT_PROFILE: u8 = 1;
@@ -113,6 +117,32 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
         }
     }
 
+    pub fn read_dpi(&self) -> Result<u16> {
+        match self.protocol {
+            ProtocolKind::IpiPixV1 { .. } => self.read_ipi_pix_v1_dpi(),
+            ProtocolKind::Eeprom16 => self.read_eeprom16_dpi(),
+            ProtocolKind::Feature64 { .. }
+            | ProtocolKind::LogitechHidpp
+            | ProtocolKind::RazerV1 { .. } => Err(anyhow!(
+                "DPI read is not implemented for {} protocol",
+                self.protocol
+            )),
+        }
+    }
+
+    pub fn set_dpi(&self, dpi: u16) -> Result<()> {
+        match self.protocol {
+            ProtocolKind::IpiPixV1 { .. } => self.set_ipi_pix_v1_dpi(dpi),
+            ProtocolKind::Eeprom16 => self.set_eeprom16_dpi(dpi),
+            ProtocolKind::Feature64 { .. }
+            | ProtocolKind::LogitechHidpp
+            | ProtocolKind::RazerV1 { .. } => Err(anyhow!(
+                "DPI writes are not implemented for {} protocol",
+                self.protocol
+            )),
+        }
+    }
+
     pub fn probe_control(&self) -> Result<()> {
         match self.protocol {
             ProtocolKind::Feature64 { .. }
@@ -203,6 +233,94 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
         Ok(())
     }
 
+    fn read_eeprom16_dpi(&self) -> Result<u16> {
+        let (active_index, dpi_levels) = self.read_eeprom16_dpi_config()?;
+        dpi_levels
+            .get(active_index)
+            .copied()
+            .ok_or_else(|| anyhow!("missing active report8 DPI level {}", active_index + 1))
+    }
+
+    fn set_eeprom16_dpi(&self, dpi: u16) -> Result<()> {
+        let (active_index, _) = self.read_eeprom16_dpi_config()?;
+        let entry = build_eeprom16_dpi_entry(dpi)?;
+        let offset = EEPROM16_DPI_TABLE_OFFSET
+            .checked_add((active_index as u8).saturating_mul(EEPROM16_DPI_ENTRY_LEN))
+            .ok_or_else(|| anyhow!("report8 DPI table offset overflow"))?;
+        let report = build_eeprom16_write(offset, &entry)?;
+        let _ = self.transact_report8(report, 7, 50, 5)?;
+        Ok(())
+    }
+
+    fn read_eeprom16_dpi_config(&self) -> Result<(usize, Vec<u16>)> {
+        let header = self.read_eeprom16_bytes(0, 6)?;
+        let level_count = usize::from(
+            *header
+                .get(2)
+                .ok_or_else(|| anyhow!("short report8 header while reading DPI level count"))?,
+        );
+        if level_count == 0 {
+            return Err(anyhow!("device returned zero report8 DPI levels"));
+        }
+
+        let raw_active = usize::from(
+            *header
+                .get(4)
+                .ok_or_else(|| anyhow!("short report8 header while reading active DPI level"))?,
+        );
+        let active_index = if (1..=level_count).contains(&raw_active) {
+            raw_active - 1
+        } else if raw_active < level_count {
+            raw_active
+        } else {
+            return Err(anyhow!(
+                "device active report8 DPI level {} is outside {} configured level(s)",
+                raw_active,
+                level_count
+            ));
+        };
+
+        let table_len = level_count
+            .checked_mul(usize::from(EEPROM16_DPI_ENTRY_LEN))
+            .ok_or_else(|| anyhow!("report8 DPI table length overflow"))?;
+        let table = self.read_eeprom16_bytes(EEPROM16_DPI_TABLE_OFFSET, table_len)?;
+        let dpi_levels = table
+            .chunks_exact(usize::from(EEPROM16_DPI_ENTRY_LEN))
+            .map(decode_eeprom16_dpi_entry)
+            .collect::<Result<Vec<_>>>()?;
+        Ok((active_index, dpi_levels))
+    }
+
+    fn read_eeprom16_bytes(&self, offset: u8, len: usize) -> Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(len);
+        let mut cursor = 0usize;
+        while cursor < len {
+            let chunk_len = (len - cursor).min(EEPROM16_MAX_TRANSFER_LEN);
+            let request_offset = offset
+                .checked_add(cursor as u8)
+                .ok_or_else(|| anyhow!("report8 eeprom offset overflow"))?;
+            let report = build_eeprom16_read(request_offset, chunk_len as u8)?;
+            let response = self.transact_report8(report, 8, 50, 5)?;
+            if response.get(3).copied() != Some(request_offset)
+                || response.get(4).copied() != Some(chunk_len as u8)
+            {
+                return Err(anyhow!(
+                    "report8 eeprom response did not match offset {request_offset} length {chunk_len}"
+                ));
+            }
+            let end = 5 + chunk_len;
+            if response.len() < end {
+                return Err(anyhow!(
+                    "short report8 eeprom response at offset {request_offset}: {} byte(s)",
+                    response.len()
+                ));
+            }
+            bytes.extend_from_slice(&response[5..end]);
+            cursor += chunk_len;
+        }
+        Ok(bytes)
+    }
+
     fn read_ipi_pix_v1_rate(&self) -> Result<PollingRate> {
         let ProtocolKind::IpiPixV1 { report_id } = self.protocol else {
             unreachable!("ipi reader called for non-ipi protocol")
@@ -243,6 +361,83 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
             .copied()
             .ok_or_else(|| anyhow!("short ipi pix v1 response while reading battery"))?;
         Ok(BatteryStatus::level_only(level))
+    }
+
+    fn read_ipi_pix_v1_dpi(&self) -> Result<u16> {
+        self.read_ipi_pix_v1_dpi_config()?.current_dpi()
+    }
+
+    fn set_ipi_pix_v1_dpi(&self, dpi: u16) -> Result<()> {
+        let ProtocolKind::IpiPixV1 { report_id } = self.protocol else {
+            unreachable!("ipi dpi writer called for non-ipi protocol")
+        };
+        let config = self.read_ipi_pix_v1_dpi_config()?;
+        let color = config.current_color()?;
+        let report = build_ipi_pix_v1_set_current_dpi(config.profile, dpi, color)?;
+        self.transport.send_feature_payload(report_id, &report)?;
+        for _ in 0..3 {
+            self.transport.sleep(Duration::from_millis(20));
+            if self.get_ipi_pix_v1_response(report_id, &report).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(anyhow!(
+            "timed out waiting for ipi pix v1 DPI write response"
+        ))
+    }
+
+    fn read_ipi_pix_v1_dpi_config(&self) -> Result<DpiConfig> {
+        let ProtocolKind::IpiPixV1 { report_id } = self.protocol else {
+            unreachable!("ipi dpi reader called for non-ipi protocol")
+        };
+        let sensor_report = build_ipi_pix_v1_get_rate();
+        self.transport
+            .send_feature_payload(report_id, &sensor_report)?;
+        self.transport.sleep(Duration::from_millis(50));
+        let sensor = self.get_ipi_pix_v1_response(report_id, &sensor_report)?;
+        let profile = sensor
+            .get(7)
+            .copied()
+            .ok_or_else(|| anyhow!("short ipi pix v1 response while reading DPI profile"))?;
+
+        let mut bytes = Vec::new();
+        for page in 0..6 {
+            let report = build_ipi_pix_v1_get_dpi_config(page);
+            self.transport.send_feature_payload(report_id, &report)?;
+            self.transport.sleep(Duration::from_millis(20));
+            let response = self.get_ipi_pix_v1_response(report_id, &report)?;
+            let start = if page == 0 { 6 } else { 5 };
+            let chunk = response.get(start..15).ok_or_else(|| {
+                anyhow!("short ipi pix v1 response while reading DPI page {page}")
+            })?;
+            bytes.extend_from_slice(chunk);
+        }
+
+        if bytes.len() < 16 + IPI_PIX_DPI_COLOR_BYTES {
+            return Err(anyhow!(
+                "short ipi pix v1 DPI config response: {} byte(s)",
+                bytes.len()
+            ));
+        }
+
+        let current_dpi = bytes[..16]
+            .chunks_exact(2)
+            .take(IPI_PIX_DPI_LEVELS)
+            .map(|chunk| {
+                let raw = u16::from(chunk[0]) | (u16::from(chunk[1]) << 8);
+                ipi_pix_v1_raw_to_dpi(raw)
+            })
+            .collect();
+        let dpi_color = bytes[16..16 + IPI_PIX_DPI_COLOR_BYTES]
+            .chunks_exact(3)
+            .map(|chunk| [chunk[0], chunk[1], chunk[2]])
+            .collect();
+
+        Ok(DpiConfig {
+            profile,
+            current_dpi,
+            dpi_color,
+        })
     }
 
     fn set_logitech_hidpp_rate(&self, rate: PollingRate) -> Result<()> {
@@ -607,6 +802,37 @@ pub fn normalize_report8_payload(raw: &[u8]) -> Vec<u8> {
     normalize_report_payload(raw, REPORT8_ID, REPORT8_PAYLOAD_LEN)
 }
 
+pub fn decode_eeprom16_dpi_entry(entry: &[u8]) -> Result<u16> {
+    if entry.len() != usize::from(EEPROM16_DPI_ENTRY_LEN) {
+        return Err(anyhow!(
+            "report8 DPI entries must be {} byte(s), got {}",
+            EEPROM16_DPI_ENTRY_LEN,
+            entry.len()
+        ));
+    }
+    let expected = eeprom16_block_checksum(&entry[..3]);
+    if entry[3] != expected {
+        return Err(anyhow!(
+            "report8 DPI entry checksum mismatch: expected 0x{expected:02x}, got 0x{:02x}",
+            entry[3]
+        ));
+    }
+    if entry[0] != entry[1] {
+        return Err(anyhow!(
+            "report8 DPI entry has different X/Y raw values: {} != {}",
+            entry[0],
+            entry[1]
+        ));
+    }
+    if entry[2] != 0 {
+        return Err(anyhow!(
+            "unsupported report8 DPI high-byte encoding 0x{:02x}",
+            entry[2]
+        ));
+    }
+    Ok(eeprom16_raw_to_dpi(entry[0]))
+}
+
 pub fn normalize_logitech_hidpp_payload(raw: &[u8]) -> Vec<u8> {
     if raw.first() == Some(&HIDPP_SHORT_ID) || raw.first() == Some(&HIDPP_LONG_ID) {
         raw[1..].to_vec()
@@ -736,6 +962,15 @@ mod tests {
         }
     }
 
+    fn report8_response(offset: u8, data: &[u8]) -> Vec<u8> {
+        let mut response = vec![0; REPORT8_PAYLOAD_LEN];
+        response[0] = 8;
+        response[3] = offset;
+        response[4] = data.len() as u8;
+        response[5..5 + data.len()].copy_from_slice(data);
+        response
+    }
+
     impl DeviceTransport for ScriptedTransport {
         fn send_feature_payload(&self, report_id: u8, payload: &[u8]) -> Result<()> {
             self.feature_writes
@@ -860,6 +1095,61 @@ mod tests {
         assert_eq!(writes[0].0, REPORT8_ID);
         assert_eq!(&writes[0].1[0..7], &[7, 0, 0, 0, 2, 64, 21]);
         assert_eq!(writes[0].1[15], 239);
+    }
+
+    #[test]
+    fn simulated_eeprom_dpi_read_uses_active_level() {
+        let transport = ScriptedTransport {
+            feature_reads: RefCell::new(VecDeque::new()),
+            feature_writes: RefCell::new(Vec::new()),
+            input_reads: RefCell::new(VecDeque::from([
+                Vec::new(),
+                report8_response(0, &[1, 0x54, 5, 0x50, 1, 0x54]),
+                Vec::new(),
+                report8_response(12, &[0x0f, 0x0f, 0, 0x37, 0x17, 0x17, 0, 0x27, 0x1f, 0x1f]),
+                Vec::new(),
+                report8_response(22, &[0, 0x17, 0x3f, 0x3f, 0, 0xd7, 0x6f, 0x6f, 0, 0x77]),
+            ])),
+            output_writes: RefCell::new(Vec::new()),
+        };
+        let protocol = ProtocolDevice::new(
+            &transport,
+            &TEST_MODEL,
+            ConnectionKind::Wired,
+            ProtocolKind::Eeprom16,
+        );
+
+        assert_eq!(protocol.read_dpi().unwrap(), 800);
+    }
+
+    #[test]
+    fn simulated_eeprom_dpi_set_writes_active_entry() {
+        let transport = ScriptedTransport {
+            feature_reads: RefCell::new(VecDeque::new()),
+            feature_writes: RefCell::new(Vec::new()),
+            input_reads: RefCell::new(VecDeque::from([
+                Vec::new(),
+                report8_response(0, &[1, 0x54, 5, 0x50, 1, 0x54]),
+                Vec::new(),
+                report8_response(12, &[0x0f, 0x0f, 0, 0x37, 0x17, 0x17, 0, 0x27, 0x1f, 0x1f]),
+                Vec::new(),
+                report8_response(22, &[0, 0x17, 0x3f, 0x3f, 0, 0xd7, 0x6f, 0x6f, 0, 0x77]),
+                Vec::new(),
+                vec![7; REPORT8_PAYLOAD_LEN],
+            ])),
+            output_writes: RefCell::new(Vec::new()),
+        };
+        let protocol = ProtocolDevice::new(
+            &transport,
+            &TEST_MODEL,
+            ConnectionKind::Wired,
+            ProtocolKind::Eeprom16,
+        );
+
+        protocol.set_dpi(3200).unwrap();
+        let writes = transport.output_writes.borrow();
+        assert_eq!(writes.len(), 4);
+        assert_eq!(&writes[3].1[0..9], &[7, 0, 0, 12, 4, 63, 63, 0, 215]);
     }
 
     #[test]

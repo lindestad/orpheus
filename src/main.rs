@@ -1,12 +1,13 @@
 use std::{io, path::PathBuf, str::FromStr, thread, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use orpheus::{
     config::{PollMonitorConfig, default_config_path},
     devices::{BatteryStatus, PollingRate, format_supported_rates},
     gui::{GuiOptions, run_gui},
     hid_device::{DeviceDiagnostic, DeviceSnapshot, HidPollMonitor, ProbeOutcome},
+    protocols::write_report8_crc,
     tui::run_tui,
     watcher::run_watch,
 };
@@ -47,6 +48,31 @@ enum Command {
     },
     /// Set the first supported device to a polling rate, e.g. 1000 or 8k.
     Set { rate: String },
+    /// Set the active DPI level on the first supported mouse.
+    Dpi {
+        value: u16,
+        /// Open this HID interface number directly instead of probing first.
+        #[arg(long)]
+        interface: Option<i32>,
+    },
+    /// Send a raw report8 packet to the first supported device.
+    #[command(hide = true)]
+    Report8 {
+        /// Hex or decimal payload bytes. Missing bytes are padded with zero.
+        bytes: Vec<String>,
+        /// Do not compute the report8 checksum byte.
+        #[arg(long)]
+        no_crc: bool,
+        /// Per-read timeout in milliseconds.
+        #[arg(long, default_value_t = 50)]
+        timeout_ms: i32,
+        /// Number of input reads to attempt after the write.
+        #[arg(long, default_value_t = 5)]
+        reads: usize,
+        /// Open this HID interface number directly instead of probing first.
+        #[arg(long)]
+        interface: Option<i32>,
+    },
     /// Write an example app-rule config file.
     InitConfig {
         #[arg(default_value = "orpheus.toml")]
@@ -77,6 +103,14 @@ fn main() -> Result<()> {
         Command::List { json } => list_devices(json),
         Command::Diagnose { json } => diagnose_devices(json),
         Command::Set { rate } => set_rate(&rate),
+        Command::Dpi { value, interface } => set_dpi(value, interface),
+        Command::Report8 {
+            bytes,
+            no_crc,
+            timeout_ms,
+            reads,
+            interface,
+        } => report8(bytes, !no_crc, timeout_ms, reads, interface),
         Command::InitConfig { path } => init_config(path),
         Command::Watch {
             config,
@@ -174,6 +208,76 @@ fn set_rate(raw_rate: &str) -> Result<()> {
     Ok(())
 }
 
+fn set_dpi(dpi: u16, interface: Option<i32>) -> Result<()> {
+    let monitor = HidPollMonitor::new()?;
+    let device = if interface.is_some() {
+        monitor.open_first_supported_unprobed(interface)?
+    } else {
+        monitor.open_first_supported()?
+    };
+    let before = device.read_dpi().ok();
+    device.set_dpi(dpi)?;
+    thread::sleep(Duration::from_millis(80));
+    let after = device.read_dpi().ok();
+
+    println!(
+        "{} {} DPI: {} -> {}",
+        device.model().name,
+        device.connection(),
+        before
+            .map(|dpi| dpi.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        after
+            .map(|dpi| dpi.to_string())
+            .unwrap_or_else(|| dpi.to_string())
+    );
+    Ok(())
+}
+
+fn report8(
+    bytes: Vec<String>,
+    write_crc: bool,
+    timeout_ms: i32,
+    reads: usize,
+    interface: Option<i32>,
+) -> Result<()> {
+    if bytes.len() > 16 {
+        bail!(
+            "report8 payload accepts at most 16 byte(s), got {}",
+            bytes.len()
+        );
+    }
+    let mut payload = [0u8; 16];
+    for (index, byte) in bytes.iter().enumerate() {
+        payload[index] = parse_byte(byte)?;
+    }
+    if write_crc {
+        write_report8_crc(&mut payload);
+    }
+
+    let monitor = HidPollMonitor::new()?;
+    let device = if interface.is_some() {
+        monitor.open_first_supported_unprobed(interface)?
+    } else {
+        monitor.open_first_supported()?
+    };
+    let responses = device.report8_exchange(payload, false, timeout_ms, reads)?;
+    println!(
+        "{} {} report8 tx: {}",
+        device.model().name,
+        device.connection(),
+        format_bytes(&payload)
+    );
+    if responses.is_empty() {
+        println!("no report8 response");
+    } else {
+        for response in responses {
+            println!("report8 rx: {}", format_bytes(&response));
+        }
+    }
+    Ok(())
+}
+
 fn init_config(path: PathBuf) -> Result<()> {
     PollMonitorConfig::write_example(&path)?;
     println!("wrote {}", path.display());
@@ -189,6 +293,28 @@ fn watch(path: PathBuf, dry_run: bool, once: bool) -> Result<()> {
         config.scan_interval_ms.max(250)
     );
     run_watch(config, dry_run, once)
+}
+
+fn parse_byte(raw: &str) -> Result<u8> {
+    let trimmed = raw.trim();
+    let value = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u8::from_str_radix(hex, 16)
+    } else {
+        trimmed.parse()
+    }
+    .map_err(|err| anyhow!("invalid byte {raw:?}: {err}"))?;
+    Ok(value)
+}
+
+fn format_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn write_json<T: Serialize>(value: &T) -> Result<()> {
