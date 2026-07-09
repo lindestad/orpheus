@@ -94,6 +94,8 @@ cargo run -- watch --config orpheus.toml --dry-run --once
 - `Enter`: apply selected rate
 - `Space`: sync target to current rate
 
+On Linux, if supported devices are visible but their `/dev/hidraw*` nodes cannot be opened, the TUI prompts to enable access. Accepting the prompt runs `sudo`, installs `/etc/udev/rules.d/70-orpheus-hidraw.rules`, reloads udev, and applies ACLs to the current hidraw nodes.
+
 ## Config
 
 `orpheus.toml` is ignored by git so local app rules do not get committed. Use `orpheus.example.toml` as the tracked template. Existing `poll-monitor.toml` files are still accepted as a fallback.
