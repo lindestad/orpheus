@@ -8,8 +8,14 @@ use serde::{
 
 pub const GWOLVES_VENDOR_ID: u16 = 0x33E4;
 pub const IPI_VENDOR_ID: u16 = 0x372E;
+pub const COMPX_VENDOR_ID: u16 = 0x3554;
 pub const LOGITECH_VENDOR_ID: u16 = 0x046D;
 pub const RAZER_VENDOR_ID: u16 = 0x1532;
+pub const IPI_PIX_DPI_LEVELS: usize = 8;
+pub const IPI_PIX_DPI_COLOR_BYTES: usize = IPI_PIX_DPI_LEVELS * 3;
+pub const EEPROM16_MAX_TRANSFER_LEN: usize = 10;
+pub const EEPROM16_DPI_TABLE_OFFSET: u8 = 12;
+pub const EEPROM16_DPI_ENTRY_LEN: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum PollingRate {
@@ -98,6 +104,47 @@ impl fmt::Display for BatteryStatus {
             (None, state, Some(raw)) => write!(f, "{state} (raw {raw})"),
             (None, state, None) => write!(f, "{state}"),
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DpiConfig {
+    pub profile: u8,
+    pub current_dpi: Vec<u16>,
+    pub dpi_color: Vec<[u8; 3]>,
+}
+
+impl DpiConfig {
+    pub fn current_level_index(&self) -> Result<usize> {
+        let one_based = (self.profile & 0xF0) >> 4;
+        if one_based == 0 {
+            bail!("device returned invalid DPI profile 0x{:02x}", self.profile);
+        }
+        let index = usize::from(one_based - 1);
+        if index >= self.current_dpi.len() {
+            bail!(
+                "device current DPI level {} is outside {} configured level(s)",
+                index + 1,
+                self.current_dpi.len()
+            );
+        }
+        Ok(index)
+    }
+
+    pub fn current_dpi(&self) -> Result<u16> {
+        let index = self.current_level_index()?;
+        self.current_dpi
+            .get(index)
+            .copied()
+            .ok_or_else(|| anyhow!("missing current DPI level {}", index + 1))
+    }
+
+    pub fn current_color(&self) -> Result<[u8; 3]> {
+        let index = self.current_level_index()?;
+        self.dpi_color
+            .get(index)
+            .copied()
+            .ok_or_else(|| anyhow!("missing current DPI color {}", index + 1))
     }
 }
 
@@ -565,6 +612,19 @@ pub const FENRIR_MODELS: &[ModelInfo] = &[
 
 pub const IPI_PIAO_MODELS: &[ModelInfo] = &[
     ModelInfo {
+        vendor_name: "Compx",
+        name: "PIAO11",
+        vid: COMPX_VENDOR_ID,
+        wired_pid: None,
+        wireless_pid: Some(0xF514),
+        receiver_pid: None,
+        receiver_idvd_pid: None,
+        protocol: ProtocolKind::Eeprom16,
+        wired_rates: RATES_8K,
+        wireless_rates: RATES_8K,
+        receiver_rates: RATES_8K,
+    },
+    ModelInfo {
         vendor_name: "IPI",
         name: "Piao",
         vid: IPI_VENDOR_ID,
@@ -991,44 +1051,116 @@ pub fn build_feature64_get_battery(protocol: ProtocolKind, connection: Connectio
 }
 
 pub fn build_eeprom16_get_rate() -> [u8; 16] {
-    let mut report = [0; 16];
-    report[0] = 8;
-    report[1] = 0;
-    report[2] = 0;
-    report[3] = 0;
-    report[4] = 2;
-    report
+    build_eeprom16_read(0, 2).expect("valid eeprom16 rate read")
 }
 
 pub fn build_eeprom16_set_rate(rate: PollingRate) -> [u8; 16] {
-    let mut report = [0; 16];
     let code = rate.eeprom16_code();
+    build_eeprom16_write(0, &[code, eeprom16_value_checksum(code)])
+        .expect("valid eeprom16 rate write")
+}
+
+pub fn build_eeprom16_read(offset: u8, len: u8) -> Result<[u8; 16]> {
+    let len = usize::from(len);
+    if len == 0 || len > EEPROM16_MAX_TRANSFER_LEN {
+        bail!(
+            "report8 eeprom reads must be 1..={} byte(s), got {len}",
+            EEPROM16_MAX_TRANSFER_LEN
+        );
+    }
+
+    let mut report = [0; 16];
+    report[0] = 8;
+    report[3] = offset;
+    report[4] = len as u8;
+    Ok(report)
+}
+
+pub fn build_eeprom16_write(offset: u8, data: &[u8]) -> Result<[u8; 16]> {
+    if data.is_empty() || data.len() > EEPROM16_MAX_TRANSFER_LEN {
+        bail!(
+            "report8 eeprom writes must be 1..={} byte(s), got {}",
+            EEPROM16_MAX_TRANSFER_LEN,
+            data.len()
+        );
+    }
+
+    let mut report = [0; 16];
     report[0] = 7;
-    report[1] = 0;
-    report[2] = 0;
-    report[3] = 0;
-    report[4] = 2;
-    report[5] = code;
-    report[6] = 85u8.wrapping_sub(code);
-    report
+    report[3] = offset;
+    report[4] = data.len() as u8;
+    report[5..5 + data.len()].copy_from_slice(data);
+    Ok(report)
+}
+
+pub fn build_eeprom16_dpi_entry(dpi: u16) -> Result<[u8; 4]> {
+    let raw = dpi_to_eeprom16_raw(dpi)?;
+    let mut entry = [raw, raw, 0, 0];
+    entry[3] = eeprom16_block_checksum(&entry[..3]);
+    Ok(entry)
+}
+
+pub const fn eeprom16_value_checksum(value: u8) -> u8 {
+    85u8.wrapping_sub(value)
+}
+
+pub fn eeprom16_block_checksum(bytes: &[u8]) -> u8 {
+    let sum = bytes
+        .iter()
+        .fold(0u8, |checksum, byte| checksum.wrapping_add(*byte));
+    85u8.wrapping_sub(sum)
+}
+
+pub fn dpi_to_eeprom16_raw(dpi: u16) -> Result<u8> {
+    if dpi == 0 || dpi % 50 != 0 {
+        bail!("DPI must be a positive 50-DPI step, got {dpi}");
+    }
+    let raw = dpi / 50 - 1;
+    u8::try_from(raw).map_err(|_| {
+        anyhow!("report8 eeprom DPI writes currently support up to 12800 DPI, got {dpi}")
+    })
+}
+
+pub const fn eeprom16_raw_to_dpi(raw: u8) -> u16 {
+    (raw as u16 + 1) * 50
 }
 
 pub fn build_ipi_pix_v1_get_rate() -> [u8; 63] {
-    let mut report = [0; 63];
+    let mut report = [0u8; 63];
     report[0..6].copy_from_slice(&[0, 80, 0, 10, 79, 64]);
     write_ipi_checksum(&mut report);
     report
 }
 
 pub fn build_ipi_pix_v1_get_basic_info() -> [u8; 63] {
-    let mut report = [0; 63];
+    let mut report = [0u8; 63];
     report[0..6].copy_from_slice(&[0, 80, 0, 2, 79, 129]);
     write_ipi_checksum(&mut report);
     report
 }
 
+pub fn build_ipi_pix_v1_get_dpi_config(page: u8) -> [u8; 63] {
+    let mut report = [0u8; 63];
+    report[0..6].copy_from_slice(&[0, 80, 0, 0, 79, 65]);
+    report[5] = report[5].wrapping_add(page);
+    write_ipi_checksum(&mut report);
+    report
+}
+
+pub fn build_ipi_pix_v1_set_current_dpi(profile: u8, dpi: u16, color: [u8; 3]) -> Result<[u8; 63]> {
+    let mut report = [0u8; 63];
+    let raw = dpi_to_ipi_pix_v1_raw(dpi)?;
+    report[0..12].copy_from_slice(&[
+        0, 80, 6, 80, 58, 0, profile, 0, 0, color[0], color[1], color[2],
+    ]);
+    report[7] = (raw & 0x00FF) as u8;
+    report[8] = ((raw & 0xFF00) >> 8) as u8;
+    write_ipi_checksum(&mut report);
+    Ok(report)
+}
+
 pub fn build_ipi_pix_v1_set_rate(connection: ConnectionKind, rate: PollingRate) -> [u8; 63] {
-    let mut report = [0; 63];
+    let mut report = [0u8; 63];
     let code = rate.ipi_pix_v1_code();
     let encoded = if connection == ConnectionKind::Wireless && code >= 4 {
         code
@@ -1050,6 +1182,20 @@ pub fn ipi_pix_v1_rate_from_sensor_byte(
         (raw & 0x70) >> 4
     };
     PollingRate::from_ipi_pix_v1_code(code)
+}
+
+pub fn dpi_to_ipi_pix_v1_raw(dpi: u16) -> Result<u16> {
+    if dpi >= 30_000 {
+        return Ok(dpi);
+    }
+    if dpi == 0 || dpi % 50 != 0 {
+        bail!("DPI must be a positive 50-DPI step, got {dpi}");
+    }
+    Ok(dpi / 50 - 1)
+}
+
+pub fn ipi_pix_v1_raw_to_dpi(raw: u16) -> u16 {
+    if raw >= 30_000 { raw } else { (raw + 1) * 50 }
 }
 
 pub fn write_ipi_checksum(payload: &mut [u8]) {
@@ -1139,6 +1285,12 @@ mod tests {
         assert_eq!(model.vendor_name, "IPI");
         assert_eq!(model.name, "Piao");
         assert_eq!(connection, ConnectionKind::Wireless);
+
+        let (model, connection) = find_model(COMPX_VENDOR_ID, 0xF514).unwrap();
+        assert_eq!(model.vendor_name, "Compx");
+        assert_eq!(model.name, "PIAO11");
+        assert_eq!(connection, ConnectionKind::Wireless);
+        assert_eq!(model.protocol, ProtocolKind::Eeprom16);
     }
 
     #[test]
@@ -1238,6 +1390,18 @@ mod tests {
     }
 
     #[test]
+    fn builds_eeprom16_dpi_reports() {
+        let read = build_eeprom16_read(12, 4).unwrap();
+        assert_eq!(&read[0..5], &[8, 0, 0, 12, 4]);
+
+        let entry = build_eeprom16_dpi_entry(3200).unwrap();
+        assert_eq!(entry, [63, 63, 0, 215]);
+
+        let write = build_eeprom16_write(12, &entry).unwrap();
+        assert_eq!(&write[0..9], &[7, 0, 0, 12, 4, 63, 63, 0, 215]);
+    }
+
+    #[test]
     fn builds_ipi_pix_v1_rate_reports() {
         let get_report = build_ipi_pix_v1_get_rate();
         assert_eq!(&get_report[0..6], &[233, 80, 0, 10, 79, 64]);
@@ -1256,6 +1420,21 @@ mod tests {
     }
 
     #[test]
+    fn builds_ipi_pix_v1_dpi_reports() {
+        let get_first_page = build_ipi_pix_v1_get_dpi_config(0);
+        assert_eq!(&get_first_page[0..6], &[224, 80, 0, 0, 79, 65]);
+
+        let get_second_page = build_ipi_pix_v1_get_dpi_config(1);
+        assert_eq!(&get_second_page[0..6], &[225, 80, 0, 0, 79, 66]);
+
+        let set_current = build_ipi_pix_v1_set_current_dpi(0x36, 3200, [0, 0, 255]).unwrap();
+        assert_eq!(
+            &set_current[0..12],
+            &[84, 80, 6, 80, 58, 0, 54, 63, 0, 0, 0, 255]
+        );
+    }
+
+    #[test]
     fn parses_ipi_pix_v1_sensor_rate_byte() {
         assert_eq!(
             ipi_pix_v1_rate_from_sensor_byte(ConnectionKind::Wired, 0x40),
@@ -1265,5 +1444,33 @@ mod tests {
             ipi_pix_v1_rate_from_sensor_byte(ConnectionKind::Wireless, 4),
             Some(PollingRate::Hz8000)
         );
+    }
+
+    #[test]
+    fn maps_ipi_pix_v1_dpi_values() {
+        assert_eq!(dpi_to_ipi_pix_v1_raw(3200).unwrap(), 63);
+        assert_eq!(ipi_pix_v1_raw_to_dpi(63), 3200);
+        assert_eq!(dpi_to_ipi_pix_v1_raw(30_000).unwrap(), 30_000);
+        assert!(dpi_to_ipi_pix_v1_raw(1234).is_err());
+    }
+
+    #[test]
+    fn tracks_ipi_pix_v1_current_dpi_level() {
+        let config = DpiConfig {
+            profile: 0x30 | 0x06,
+            current_dpi: vec![400, 800, 3200, 6400, 12_800, 26_000],
+            dpi_color: vec![
+                [255, 0, 0],
+                [0, 255, 0],
+                [0, 0, 255],
+                [0, 255, 255],
+                [255, 255, 0],
+                [255, 0, 255],
+            ],
+        };
+
+        assert_eq!(config.current_level_index().unwrap(), 2);
+        assert_eq!(config.current_dpi().unwrap(), 3200);
+        assert_eq!(config.current_color().unwrap(), [0, 0, 255]);
     }
 }

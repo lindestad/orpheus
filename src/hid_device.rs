@@ -11,7 +11,8 @@ use crate::devices::{
     format_supported_rates,
 };
 use crate::protocols::{
-    DeviceTransport, ProtocolDevice, normalize_feature_payload, normalize_report_payload,
+    DeviceTransport, ProtocolDevice, REPORT8_ID, REPORT8_PAYLOAD_LEN, normalize_feature_payload,
+    normalize_report_payload, write_report8_crc,
 };
 
 #[derive(Clone, Debug)]
@@ -188,7 +189,7 @@ impl HidPollMonitor {
                     Err(err) => {
                         protocol_results.push(ProtocolDiagnostic {
                             protocol,
-                            open: ProbeOutcome::error_timed(err.to_string(), started),
+                            open: ProbeOutcome::error_timed(format!("{err:#}"), started),
                             control_probe: ProbeOutcome::skipped("open failed"),
                             rate_read: ProbeOutcome::skipped("open failed"),
                             battery_read: ProbeOutcome::skipped("open failed"),
@@ -300,6 +301,38 @@ impl HidPollMonitor {
             }
         }
         Err(anyhow!("no supported polling-rate device found"))
+    }
+
+    pub fn open_first_supported_unprobed(
+        &self,
+        interface_number: Option<i32>,
+    ) -> Result<PollingDevice> {
+        for info in self.api.device_list() {
+            if interface_number.is_some_and(|wanted| info.interface_number() != wanted) {
+                continue;
+            }
+            let vid = info.vendor_id();
+            let pid = info.product_id();
+            let Some((model, connection)) = find_model(vid, pid) else {
+                continue;
+            };
+            let device = info
+                .open_device(&self.api)
+                .with_context(|| format!("failed to open {:04x}:{:04x}", vid, pid))?;
+            return Ok(PollingDevice::new(
+                device,
+                model,
+                connection,
+                model.protocol,
+            ));
+        }
+        if let Some(interface_number) = interface_number {
+            Err(anyhow!(
+                "no supported HID interface {interface_number} found"
+            ))
+        } else {
+            Err(anyhow!("no supported HID interface found"))
+        }
     }
 
     pub fn open_by_vid_pid(&self, target_vid: u16, target_pid: u16) -> Result<PollingDevice> {
@@ -538,7 +571,7 @@ fn timed_probe(probe: impl FnOnce() -> Result<String>) -> ProbeOutcome {
     let started = Instant::now();
     match probe() {
         Ok(detail) => ProbeOutcome::ok_timed(detail, started),
-        Err(err) => ProbeOutcome::error_timed(err.to_string(), started),
+        Err(err) => ProbeOutcome::error_timed(format!("{err:#}"), started),
     }
 }
 
@@ -655,6 +688,44 @@ impl PollingDevice {
 
     pub fn set_rate(&self, rate: PollingRate) -> Result<()> {
         self.protocol_device().set_rate(rate)
+    }
+
+    pub fn read_dpi(&self) -> Result<u16> {
+        self.protocol_device().read_dpi()
+    }
+
+    pub fn set_dpi(&self, dpi: u16) -> Result<()> {
+        self.protocol_device().set_dpi(dpi)
+    }
+
+    pub fn report8_exchange(
+        &self,
+        mut payload: [u8; REPORT8_PAYLOAD_LEN],
+        write_crc: bool,
+        timeout_ms: i32,
+        reads: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        while matches!(
+            self.device
+                .read_input_payload(REPORT8_ID, REPORT8_PAYLOAD_LEN, 1),
+            Ok(response) if !response.is_empty()
+        ) {}
+
+        if write_crc {
+            write_report8_crc(&mut payload);
+        }
+        self.device.write_output_payload(REPORT8_ID, &payload)?;
+
+        let mut responses = Vec::new();
+        for _ in 0..reads {
+            let response =
+                self.device
+                    .read_input_payload(REPORT8_ID, REPORT8_PAYLOAD_LEN, timeout_ms)?;
+            if !response.is_empty() {
+                responses.push(response);
+            }
+        }
+        Ok(responses)
     }
 
     fn protocol_device(&self) -> ProtocolDevice<'_, HidDevice> {

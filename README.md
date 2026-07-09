@@ -10,8 +10,10 @@ This is an early working prototype. It has been tested against:
 
 - G-Wolves Fenrir receiver `33e4:3517`, including rate read/write and battery level/status.
 - IPI Piao wireless receiver `372e:1014`, including rate read/write and battery level.
+- Compx PIAO11 `3554:f514`, including report8 rate read and DPI write on HID interface 1.
 
 Supported model IDs currently cover known Fenrir, Fenrir Pro, and Fenir Max wired/receiver IDs from G-Wolves WebHID protocol data, plus IPI Piao/Float-style PIX v1 mouse IDs from `https://shan.ipigame.cn/devices`.
+Compx-branded PIAO11 devices seen as `3554:f514` use the 16-byte report8 EEPROM path exposed by their vendor-control HID interface.
 
 Additional protocol support has been implemented from WebHID driver references, but has not yet been verified with local hardware:
 
@@ -63,6 +65,13 @@ Set the first supported device to a rate:
 ```powershell
 cargo run -- set 1000
 cargo run -- set 8k
+```
+
+Set the active DPI level on a supported mouse:
+
+```powershell
+cargo run -- dpi 3200
+cargo run -- dpi --interface 1 3200
 ```
 
 When multiple supported devices are connected, use the TUI to choose a specific device before applying a rate.
