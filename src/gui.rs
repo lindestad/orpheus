@@ -469,16 +469,15 @@ fn draw_device_detail(ui: &mut egui::Ui, app: &mut OrpheusGui) {
                 if ui
                     .add_enabled(can_set, Button::new(RichText::new(label).strong()))
                     .clicked()
+                    && let Some(rate) = target
                 {
-                    if let Some(rate) = target {
-                        app.worker.send(WorkerCommand::SetRate {
-                            vid: device.vid,
-                            pid: device.pid,
-                            rate,
-                        });
-                        app.status =
-                            format!("Queued {} for {:04x}:{:04x}", rate, device.vid, device.pid);
-                    }
+                    app.worker.send(WorkerCommand::SetRate {
+                        vid: device.vid,
+                        pid: device.pid,
+                        rate,
+                    });
+                    app.status =
+                        format!("Queued {} for {:04x}:{:04x}", rate, device.vid, device.pid);
                 }
                 if device.current_rate == target {
                     ui.label(RichText::new("Already at target").color(MUTED));

@@ -81,17 +81,17 @@ impl DeviceSnapshotCache {
             visible.insert(key);
 
             if let Some(cached) = self.entries.get(&key).copied() {
-                if device.current_rate.is_none() {
-                    if let Some(rate) = cached.current_rate {
-                        device.current_rate = Some(rate);
-                        device.cached_rate = true;
-                    }
+                if device.current_rate.is_none()
+                    && let Some(rate) = cached.current_rate
+                {
+                    device.current_rate = Some(rate);
+                    device.cached_rate = true;
                 }
-                if device.battery.is_none() {
-                    if let Some(battery) = cached.battery {
-                        device.battery = Some(battery);
-                        device.cached_battery = true;
-                    }
+                if device.battery.is_none()
+                    && let Some(battery) = cached.battery
+                {
+                    device.battery = Some(battery);
+                    device.cached_battery = true;
                 }
             }
 

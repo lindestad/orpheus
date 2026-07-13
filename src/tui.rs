@@ -25,6 +25,7 @@ use crate::{
 
 const FOCUSED_REFRESH_INTERVAL: Duration = Duration::from_millis(1_000);
 const UNFOCUSED_REFRESH_INTERVAL: Duration = Duration::from_millis(5_000);
+const UNAVAILABLE_REFRESH_INTERVAL: Duration = Duration::from_millis(5_000);
 const PENDING_RETRY_INTERVAL: Duration = Duration::from_millis(1_000);
 const CHARGING_ICON: &str = "⚡";
 
@@ -156,6 +157,8 @@ impl TuiApp {
     fn refresh_interval(&self) -> Duration {
         if self.pending_rate.is_some() {
             PENDING_RETRY_INTERVAL
+        } else if self.devices.iter().any(device_is_unavailable) {
+            UNAVAILABLE_REFRESH_INTERVAL
         } else if self.focused {
             FOCUSED_REFRESH_INTERVAL
         } else {
@@ -168,7 +171,6 @@ impl TuiApp {
     }
 
     fn refresh(&mut self, monitor: &HidPollMonitor) {
-        self.last_refresh = Instant::now();
         match monitor.scan() {
             Ok(mut devices) => {
                 self.snapshot_cache.apply(&mut devices);
@@ -191,6 +193,7 @@ impl TuiApp {
                 self.status = format!("scan failed: {err}");
             }
         }
+        self.last_refresh = Instant::now();
     }
 
     fn refresh_access_prompt(&mut self, monitor: &HidPollMonitor) {
@@ -776,6 +779,14 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     );
 }
 
+fn device_is_unavailable(device: &DeviceSnapshot) -> bool {
+    !device.connection.is_wired()
+        && device
+            .read_error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out waiting for"))
+}
+
 fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if app.devices.is_empty() {
         frame.render_widget(Clear, area);
@@ -793,6 +804,8 @@ fn draw_devices(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let power = power_summary(device);
         let status = if device.cached_rate || device.cached_battery {
             "cached"
+        } else if device_is_unavailable(device) {
+            "asleep"
         } else {
             device
                 .read_error
@@ -908,7 +921,13 @@ fn draw_rate_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     lines.push(Line::raw(""));
     lines.push(rate_line(&device.supported_rates, app.target_rate));
 
-    if let Some(error) = &device.read_error {
+    if device_is_unavailable(device) {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("unavailable ", Style::default().fg(Color::Yellow)),
+            Span::raw("mouse may be asleep; move it or press r to retry"),
+        ]));
+    } else if let Some(error) = &device.read_error {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
             Span::styled("read error ", Style::default().fg(Color::Yellow)),
@@ -1208,6 +1227,13 @@ mod tests {
         let mut app = TuiApp::new();
         assert_eq!(app.refresh_interval(), FOCUSED_REFRESH_INTERVAL);
 
+        let mut unavailable = test_device(None);
+        unavailable.read_error =
+            Some("timed out waiting for report8 command 8 after 5 attempts".to_string());
+        app.devices.push(unavailable);
+        assert_eq!(app.refresh_interval(), UNAVAILABLE_REFRESH_INTERVAL);
+
+        app.devices.clear();
         app.set_focused(false);
         assert_eq!(app.refresh_interval(), UNFOCUSED_REFRESH_INTERVAL);
 

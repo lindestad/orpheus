@@ -109,13 +109,16 @@ pub fn run_watch(config: PollMonitorConfig, dry_run: bool, once: bool) -> Result
                         desired_changed,
                     );
                 if should_poll_devices {
+                    let mut state = PowerPolicyState {
+                        battery_trends: &mut battery_trends,
+                        snapshot_cache: &mut snapshot_cache,
+                        pending_changes: &mut pending_rate_changes,
+                    };
                     apply_power_policy(
                         monitor.as_ref(),
                         dry_run,
                         &config,
-                        &mut battery_trends,
-                        &mut snapshot_cache,
-                        &mut pending_rate_changes,
+                        &mut state,
                         active.as_ref(),
                         &desired,
                     )
@@ -389,20 +392,24 @@ fn apply_desired(
     Ok(())
 }
 
+struct PowerPolicyState<'a> {
+    battery_trends: &'a mut BatteryTrendTracker,
+    snapshot_cache: &'a mut DeviceSnapshotCache,
+    pending_changes: &'a mut PendingRateQueue,
+}
+
 fn apply_power_policy(
     monitor: Option<&HidPollMonitor>,
     dry_run: bool,
     config: &PollMonitorConfig,
-    battery_trends: &mut BatteryTrendTracker,
-    snapshot_cache: &mut DeviceSnapshotCache,
-    pending_changes: &mut PendingRateQueue,
+    state: &mut PowerPolicyState<'_>,
     active: Option<&ActiveRule>,
     desired: &DesiredRate,
 ) -> Result<()> {
     let monitor = monitor.expect("power-aware watcher must have a monitor");
     let mut devices = monitor.scan()?;
-    snapshot_cache.apply(&mut devices);
-    pending_changes.retain_visible(&devices);
+    state.snapshot_cache.apply(&mut devices);
+    state.pending_changes.retain_visible(&devices);
     if devices.is_empty() {
         if dry_run {
             println!("dry run: no supported device visible for {desired}");
@@ -410,7 +417,7 @@ fn apply_power_policy(
         }
         return Ok(());
     }
-    battery_trends.record(&devices);
+    state.battery_trends.record(&devices);
 
     let idle_rate = active
         .and_then(|rule| rule.restore)
@@ -418,7 +425,7 @@ fn apply_power_policy(
         .unwrap_or(config.default_rate);
     let classes = devices
         .iter()
-        .map(|device| classify_power(device, config, battery_trends))
+        .map(|device| classify_power(device, config, state.battery_trends))
         .collect::<Vec<_>>();
     let has_known_discharging = classes.contains(&PowerClass::Discharging);
 
@@ -431,7 +438,14 @@ fn apply_power_policy(
             has_known_discharging,
             config.allow_unknown_power_active,
         );
-        apply_snapshot_rate(monitor, dry_run, pending_changes, device, target, reason)?;
+        apply_snapshot_rate(
+            monitor,
+            dry_run,
+            state.pending_changes,
+            device,
+            target,
+            reason,
+        )?;
     }
 
     Ok(())
@@ -848,9 +862,9 @@ mod tests {
             ProtocolKind::IpiPixV1 { report_id: 3 },
             BatteryStatus::level_only(80),
         );
-        tracker.record_at(&[device.clone()], now);
+        tracker.record_at(std::slice::from_ref(&device), now);
         device.battery = Some(BatteryStatus::level_only(81));
-        tracker.record_at(&[device.clone()], now + Duration::from_secs(60));
+        tracker.record_at(std::slice::from_ref(&device), now + Duration::from_secs(60));
 
         assert_eq!(
             classify_power(&device, &config, &tracker),
@@ -876,13 +890,13 @@ mod tests {
             },
             BatteryStatus::with_raw_state(75, ChargeState::Discharging, 0),
         );
-        tracker.record_at(&[device.clone()], now);
+        tracker.record_at(std::slice::from_ref(&device), now);
         device.battery = Some(BatteryStatus::with_raw_state(
             76,
             ChargeState::Discharging,
             0,
         ));
-        tracker.record_at(&[device.clone()], now + Duration::from_secs(60));
+        tracker.record_at(std::slice::from_ref(&device), now + Duration::from_secs(60));
 
         assert_eq!(
             classify_power(&device, &config, &tracker),
@@ -906,8 +920,8 @@ mod tests {
             ProtocolKind::IpiPixV1 { report_id: 3 },
             BatteryStatus::level_only(80),
         );
-        tracker.record_at(&[device.clone()], now);
-        tracker.record_at(&[device.clone()], now + Duration::from_secs(60));
+        tracker.record_at(std::slice::from_ref(&device), now);
+        tracker.record_at(std::slice::from_ref(&device), now + Duration::from_secs(60));
 
         assert_eq!(
             classify_power(&device, &config, &tracker),

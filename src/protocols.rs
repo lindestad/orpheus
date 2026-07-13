@@ -643,22 +643,17 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
         write_report8_crc(&mut payload);
         for _ in 0..attempts {
             self.transport.write_output_payload(REPORT8_ID, &payload)?;
-            for _ in 0..attempts {
-                let response = self.transport.read_input_payload(
-                    REPORT8_ID,
-                    REPORT8_PAYLOAD_LEN,
-                    step_delay_ms,
-                )?;
-                if response.is_empty() {
-                    continue;
-                }
-                if response.first() == Some(&response_command) {
-                    return Ok(response);
-                }
+            let response = self.transport.read_input_payload(
+                REPORT8_ID,
+                REPORT8_PAYLOAD_LEN,
+                step_delay_ms,
+            )?;
+            if response.first() == Some(&response_command) {
+                return Ok(response);
             }
         }
         Err(anyhow!(
-            "timed out waiting for report8 command {response_command}"
+            "timed out waiting for report8 command {response_command} after {attempts} attempts"
         ))
     }
 
@@ -1095,6 +1090,22 @@ mod tests {
         assert_eq!(writes[0].0, REPORT8_ID);
         assert_eq!(&writes[0].1[0..7], &[7, 0, 0, 0, 2, 64, 21]);
         assert_eq!(writes[0].1[15], 239);
+    }
+
+    #[test]
+    fn report8_timeout_is_bounded_by_attempt_count() {
+        let transport = ScriptedTransport::with_feature_reads(Vec::new());
+        let protocol = ProtocolDevice::new(
+            &transport,
+            &TEST_MODEL,
+            ConnectionKind::Wired,
+            ProtocolKind::Eeprom16,
+        );
+
+        let error = protocol.read_rate().unwrap_err().to_string();
+
+        assert!(error.ends_with("after 5 attempts"));
+        assert_eq!(transport.output_writes.borrow().len(), 5);
     }
 
     #[test]

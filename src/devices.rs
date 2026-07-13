@@ -1120,7 +1120,7 @@ pub fn eeprom16_block_checksum(bytes: &[u8]) -> u8 {
 }
 
 pub fn dpi_to_eeprom16_raw(dpi: u16) -> Result<u8> {
-    if dpi == 0 || dpi % 50 != 0 {
+    if dpi == 0 || !dpi.is_multiple_of(50) {
         bail!("DPI must be a positive 50-DPI step, got {dpi}");
     }
     let raw = dpi / 50 - 1;
@@ -1196,7 +1196,7 @@ pub fn dpi_to_ipi_pix_v1_raw(dpi: u16) -> Result<u16> {
     if dpi >= 30_000 {
         return Ok(dpi);
     }
-    if dpi == 0 || dpi % 50 != 0 {
+    if dpi == 0 || !dpi.is_multiple_of(50) {
         bail!("DPI must be a positive 50-DPI step, got {dpi}");
     }
     Ok(dpi / 50 - 1)
