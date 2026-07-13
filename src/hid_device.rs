@@ -15,6 +15,9 @@ use crate::protocols::{
     normalize_report_payload, write_report8_crc,
 };
 
+const REPORT8_CONTROL_USAGE_PAGE: u16 = 0xFF02;
+const REPORT8_CONTROL_USAGE: u16 = 0x0002;
+
 #[derive(Clone, Debug)]
 pub struct DeviceSnapshot {
     pub path: String,
@@ -140,17 +143,25 @@ impl HidPollMonitor {
 
     pub fn scan(&self) -> Result<Vec<DeviceSnapshot>> {
         let mut devices = Vec::new();
+        let mut seen_paths = HashSet::new();
         for info in self.api.device_list() {
             let vid = info.vendor_id();
             let pid = info.product_id();
             let Some((model, connection)) = find_model(vid, pid) else {
                 continue;
             };
+            if !is_control_interface(info, model.protocol) {
+                continue;
+            }
+            let path = info.path().to_string_lossy().into_owned();
+            if !seen_paths.insert(path.clone()) {
+                continue;
+            }
 
             let probe = self.probe_info(info, model, connection);
 
             let snapshot = DeviceSnapshot {
-                path: info.path().to_string_lossy().into_owned(),
+                path,
                 vid,
                 pid,
                 product_name: info.product_string().map(ToOwned::to_owned),
@@ -174,12 +185,20 @@ impl HidPollMonitor {
 
     pub fn diagnose(&self) -> Vec<DeviceDiagnostic> {
         let mut diagnostics = Vec::new();
+        let mut seen_paths = HashSet::new();
         for info in self.api.device_list() {
             let vid = info.vendor_id();
             let pid = info.product_id();
             let Some((model, connection)) = find_model(vid, pid) else {
                 continue;
             };
+            if !is_control_interface(info, model.protocol) {
+                continue;
+            }
+            let path = info.path().to_string_lossy().into_owned();
+            if !seen_paths.insert(path.clone()) {
+                continue;
+            }
 
             let mut protocol_results = Vec::new();
             for protocol in model.protocol_candidates() {
@@ -208,8 +227,11 @@ impl HidPollMonitor {
                 } else {
                     ProbeOutcome::skipped("protocol does not support current-rate read")
                 };
-                let battery_read =
-                    timed_probe(|| live.read_battery().map(|battery| battery.to_string()));
+                let battery_read = if live.supports_battery_read() {
+                    timed_probe(|| live.read_battery().map(|battery| battery.to_string()))
+                } else {
+                    ProbeOutcome::skipped("protocol does not support battery telemetry")
+                };
 
                 protocol_results.push(ProtocolDiagnostic {
                     protocol,
@@ -221,7 +243,7 @@ impl HidPollMonitor {
             }
 
             diagnostics.push(DeviceDiagnostic {
-                path: info.path().to_string_lossy().into_owned(),
+                path,
                 vid,
                 pid,
                 manufacturer: info.manufacturer_string().map(ToOwned::to_owned),
@@ -253,6 +275,9 @@ impl HidPollMonitor {
                 let Some((model, _)) = find_model(vid, pid) else {
                     continue;
                 };
+                if !is_control_interface(info, model.protocol) {
+                    continue;
+                }
 
                 let Err(err) = info.open_device(&self.api) else {
                     continue;
@@ -285,12 +310,18 @@ impl HidPollMonitor {
     }
 
     pub fn open_first_supported(&self) -> Result<PollingDevice> {
+        let mut seen_paths = HashSet::new();
         for info in self.api.device_list() {
             let vid = info.vendor_id();
             let pid = info.product_id();
             let Some((model, connection)) = find_model(vid, pid) else {
                 continue;
             };
+            if !is_control_interface(info, model.protocol)
+                || !seen_paths.insert(info.path().to_owned())
+            {
+                continue;
+            }
             for protocol in model.protocol_candidates() {
                 if let Ok(device) = info.open_device(&self.api) {
                     let live = PollingDevice::new(device, model, connection, protocol);
@@ -307,6 +338,7 @@ impl HidPollMonitor {
         &self,
         interface_number: Option<i32>,
     ) -> Result<PollingDevice> {
+        let mut seen_paths = HashSet::new();
         for info in self.api.device_list() {
             if interface_number.is_some_and(|wanted| info.interface_number() != wanted) {
                 continue;
@@ -316,6 +348,12 @@ impl HidPollMonitor {
             let Some((model, connection)) = find_model(vid, pid) else {
                 continue;
             };
+            if interface_number.is_none() && !is_control_interface(info, model.protocol) {
+                continue;
+            }
+            if !seen_paths.insert(info.path().to_owned()) {
+                continue;
+            }
             let device = info
                 .open_device(&self.api)
                 .with_context(|| format!("failed to open {:04x}:{:04x}", vid, pid))?;
@@ -337,6 +375,7 @@ impl HidPollMonitor {
 
     pub fn open_by_vid_pid(&self, target_vid: u16, target_pid: u16) -> Result<PollingDevice> {
         let mut last_error = None;
+        let mut seen_paths = HashSet::new();
         for info in self.api.device_list() {
             let vid = info.vendor_id();
             let pid = info.product_id();
@@ -346,6 +385,11 @@ impl HidPollMonitor {
             let Some((model, connection)) = find_model(vid, pid) else {
                 continue;
             };
+            if !is_control_interface(info, model.protocol)
+                || !seen_paths.insert(info.path().to_owned())
+            {
+                continue;
+            }
             for protocol in model.protocol_candidates() {
                 let device = info
                     .open_device(&self.api)
@@ -372,6 +416,43 @@ impl HidPollMonitor {
         }
     }
 
+    pub fn open_by_path(&self, target_path: &str) -> Result<PollingDevice> {
+        let mut last_error = None;
+        for info in self.api.device_list() {
+            if info.path().to_string_lossy() != target_path {
+                continue;
+            }
+            let vid = info.vendor_id();
+            let pid = info.product_id();
+            let Some((model, connection)) = find_model(vid, pid) else {
+                continue;
+            };
+            if !is_control_interface(info, model.protocol) {
+                continue;
+            }
+            for protocol in model.protocol_candidates() {
+                let device = info
+                    .open_device(&self.api)
+                    .with_context(|| format!("failed to open {target_path}"))?;
+                let live = PollingDevice::new(device, model, connection, protocol);
+                match self.probe_control_interface(&live) {
+                    Ok(()) => return Ok(live),
+                    Err(err) => last_error = Some(format!("{protocol}: {err}")),
+                }
+            }
+        }
+
+        if let Some(error) = last_error {
+            Err(anyhow!(
+                "found {target_path}, but its control interface did not answer: {error}"
+            ))
+        } else {
+            Err(anyhow!(
+                "no supported control interface found at {target_path}"
+            ))
+        }
+    }
+
     fn probe_info(
         &self,
         info: &hidapi::DeviceInfo,
@@ -391,7 +472,7 @@ impl HidPollMonitor {
             if live.supports_rate_read() {
                 match live.read_rate() {
                     Ok(rate) => {
-                        let battery = self.probe_battery(&live);
+                        let battery = self.probe_battery_if_supported(&live);
                         return DeviceProbe {
                             protocol,
                             current_rate: Some(rate),
@@ -402,7 +483,7 @@ impl HidPollMonitor {
                     }
                     Err(err) => {
                         let read_error = err.to_string();
-                        let battery = self.probe_battery(&live);
+                        let battery = self.probe_battery_if_supported(&live);
                         if battery.battery.is_some() {
                             return DeviceProbe {
                                 protocol,
@@ -419,7 +500,7 @@ impl HidPollMonitor {
                     }
                 }
             } else {
-                let battery = self.probe_battery(&live);
+                let battery = self.probe_battery_if_supported(&live);
                 if battery.battery.is_some() {
                     return DeviceProbe {
                         protocol,
@@ -457,6 +538,17 @@ impl HidPollMonitor {
                 battery: None,
                 error: Some(err.to_string()),
             },
+        }
+    }
+
+    fn probe_battery_if_supported(&self, live: &PollingDevice) -> BatteryProbe {
+        if live.supports_battery_read() {
+            self.probe_battery(live)
+        } else {
+            BatteryProbe {
+                battery: None,
+                error: None,
+            }
         }
     }
 
@@ -576,26 +668,22 @@ fn timed_probe(probe: impl FnOnce() -> Result<String>) -> ProbeOutcome {
 }
 
 fn device_usage_page(info: &hidapi::DeviceInfo) -> Option<u16> {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = info;
-        None
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Some(info.usage_page())
-    }
+    Some(info.usage_page())
 }
 
 fn device_usage(info: &hidapi::DeviceInfo) -> Option<u16> {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = info;
-        None
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Some(info.usage())
+    Some(info.usage())
+}
+
+fn is_control_interface(info: &hidapi::DeviceInfo, protocol: ProtocolKind) -> bool {
+    match protocol {
+        ProtocolKind::Eeprom16 => {
+            info.usage_page() == REPORT8_CONTROL_USAGE_PAGE && info.usage() == REPORT8_CONTROL_USAGE
+        }
+        ProtocolKind::Feature64 { .. }
+        | ProtocolKind::IpiPixV1 { .. }
+        | ProtocolKind::LogitechHidpp
+        | ProtocolKind::RazerV1 { .. } => true,
     }
 }
 
@@ -672,6 +760,14 @@ impl PollingDevice {
 
     pub fn supports_rate_read(&self) -> bool {
         self.protocol.supports_rate_read()
+    }
+
+    pub fn supports_battery_read(&self) -> bool {
+        self.protocol.supports_battery_read()
+    }
+
+    pub fn supports_dpi(&self) -> bool {
+        self.protocol.supports_dpi()
     }
 
     pub fn probe_control(&self) -> Result<()> {
@@ -759,7 +855,9 @@ impl DeviceTransport for HidDevice {
         let mut buffer = Vec::with_capacity(payload.len() + 1);
         buffer.push(report_id);
         buffer.extend_from_slice(payload);
-        self.write(&buffer).context("failed to write output report")
+        self.send_output_report(&buffer)
+            .context("failed to send output report")?;
+        Ok(buffer.len())
     }
 
     fn read_input_payload(

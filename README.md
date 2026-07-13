@@ -74,7 +74,7 @@ cargo run -- dpi 3200
 cargo run -- dpi --interface 1 3200
 ```
 
-When multiple supported devices are connected, use the TUI to choose a specific device before applying a rate.
+When multiple supported devices are connected, use the TUI to choose a specific device before applying a rate or DPI.
 
 Create a local config file:
 
@@ -102,6 +102,7 @@ cargo run -- watch --config orpheus.toml --dry-run --once
 - `left` / `right` or `h` / `l`: select target polling rate
 - `Enter`: apply selected rate
 - `Space`: sync target to current rate
+- `d`: open the DPI popup for the selected mouse; type a value and press `Enter` to set and verify it
 
 On Linux, if supported devices are visible but their `/dev/hidraw*` nodes cannot be opened, the TUI prompts to enable access. Accepting the prompt runs `sudo`, installs `/etc/udev/rules.d/70-orpheus-hidraw.rules`, reloads udev, and applies ACLs to the current hidraw nodes.
 

@@ -81,6 +81,19 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         }
                         continue;
                     }
+                    if app.dpi_prompt.is_some() {
+                        match key.code {
+                            KeyCode::Enter => app.apply_dpi(&monitor),
+                            KeyCode::Esc => app.dismiss_dpi_prompt(),
+                            KeyCode::Backspace => app.remove_dpi_digit(),
+                            KeyCode::Delete => app.clear_dpi_input(),
+                            KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                                app.push_dpi_digit(digit)
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('r') => app.refresh(&monitor),
@@ -90,6 +103,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         KeyCode::Right | KeyCode::Char('l') => app.move_rate(1),
                         KeyCode::Enter => app.apply_rate(&monitor),
                         KeyCode::Char(' ') => app.sync_target_to_current(),
+                        KeyCode::Char('d') => app.open_dpi_prompt(&monitor),
                         _ => {}
                     }
                 }
@@ -114,6 +128,7 @@ struct TuiApp {
     last_refresh: Instant,
     access_prompt: Option<AccessPrompt>,
     access_prompt_dismissed: bool,
+    dpi_prompt: Option<DpiPrompt>,
 }
 
 impl TuiApp {
@@ -130,6 +145,7 @@ impl TuiApp {
             last_refresh: Instant::now() - FOCUSED_REFRESH_INTERVAL,
             access_prompt: None,
             access_prompt_dismissed: false,
+            dpi_prompt: None,
         }
     }
 
@@ -236,6 +252,125 @@ impl TuiApp {
         {
             self.target_rate = Some(current);
             self.target_dirty = false;
+        }
+    }
+
+    fn open_dpi_prompt(&mut self, monitor: &HidPollMonitor) {
+        let Some(device) = self.selected_device().cloned() else {
+            self.status = "no device selected".to_string();
+            return;
+        };
+        if !device.protocol.supports_dpi() {
+            self.status = format!("DPI is not supported for {}", device.protocol);
+            return;
+        }
+
+        match monitor
+            .open_by_path(&device.path)
+            .and_then(|live| live.read_dpi())
+        {
+            Ok(current) => {
+                self.dpi_prompt = Some(DpiPrompt {
+                    current,
+                    input: current.to_string(),
+                    error: None,
+                    replace_on_input: true,
+                });
+                self.status = format!("{} DPI", current);
+                self.last_refresh = Instant::now();
+            }
+            Err(err) => self.status = format!("DPI read failed: {err}"),
+        }
+    }
+
+    fn dismiss_dpi_prompt(&mut self) {
+        self.dpi_prompt = None;
+        self.status = "DPI change cancelled".to_string();
+    }
+
+    fn push_dpi_digit(&mut self, digit: char) {
+        let Some(prompt) = self.dpi_prompt.as_mut() else {
+            return;
+        };
+        if prompt.replace_on_input {
+            prompt.input.clear();
+            prompt.replace_on_input = false;
+        }
+        if prompt.input.len() < 5 {
+            prompt.input.push(digit);
+        }
+        prompt.error = None;
+    }
+
+    fn remove_dpi_digit(&mut self) {
+        let Some(prompt) = self.dpi_prompt.as_mut() else {
+            return;
+        };
+        if prompt.replace_on_input {
+            prompt.input.clear();
+            prompt.replace_on_input = false;
+        } else {
+            prompt.input.pop();
+        }
+        prompt.error = None;
+    }
+
+    fn clear_dpi_input(&mut self) {
+        let Some(prompt) = self.dpi_prompt.as_mut() else {
+            return;
+        };
+        prompt.input.clear();
+        prompt.replace_on_input = false;
+        prompt.error = None;
+    }
+
+    fn apply_dpi(&mut self, monitor: &HidPollMonitor) {
+        let Some(prompt) = self.dpi_prompt.as_ref() else {
+            return;
+        };
+        let requested = match prompt.input.parse::<u16>() {
+            Ok(dpi) if dpi > 0 => dpi,
+            _ => {
+                if let Some(prompt) = self.dpi_prompt.as_mut() {
+                    prompt.error = Some("enter a positive whole-number DPI".to_string());
+                    prompt.replace_on_input = true;
+                }
+                return;
+            }
+        };
+        let Some(device) = self.selected_device().cloned() else {
+            self.dpi_prompt = None;
+            self.status = "selected device disappeared".to_string();
+            return;
+        };
+
+        let result = monitor.open_by_path(&device.path).and_then(|live| {
+            live.set_dpi(requested)?;
+            std::thread::sleep(Duration::from_millis(50));
+            live.read_dpi()
+        });
+
+        match result {
+            Ok(after) if after == requested => {
+                self.dpi_prompt = None;
+                self.status = format!("set {} to {after} DPI (verified)", device.model_name);
+                self.last_refresh = Instant::now();
+            }
+            Ok(after) => {
+                if let Some(prompt) = self.dpi_prompt.as_mut() {
+                    prompt.error = Some(format!(
+                        "verification failed: requested {requested}, device reports {after}"
+                    ));
+                    prompt.current = after;
+                    prompt.replace_on_input = true;
+                }
+            }
+            Err(err) => {
+                if let Some(prompt) = self.dpi_prompt.as_mut() {
+                    prompt.error = Some(err.to_string());
+                    prompt.replace_on_input = true;
+                }
+            }
         }
     }
 
@@ -409,6 +544,14 @@ impl TuiApp {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AccessPrompt {
     candidates: Vec<HidAccessCandidate>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DpiPrompt {
+    current: u16,
+    input: String,
+    error: Option<String>,
+    replace_on_input: bool,
 }
 
 fn enable_hid_access(
@@ -611,6 +754,8 @@ fn draw(frame: &mut Frame<'_>, app: &TuiApp) {
     draw_footer(frame, chunks[3], app);
     if let Some(prompt) = &app.access_prompt {
         draw_access_prompt(frame, area, prompt);
+    } else if let Some(prompt) = &app.dpi_prompt {
+        draw_dpi_prompt(frame, area, prompt);
     }
 }
 
@@ -838,6 +983,56 @@ fn draw_access_prompt(frame: &mut Frame<'_>, area: Rect, prompt: &AccessPrompt) 
     );
 }
 
+fn draw_dpi_prompt(frame: &mut Frame<'_>, area: Rect, prompt: &DpiPrompt) {
+    let modal = centered_rect(62, 10, area);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("current ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{} DPI", prompt.current),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("new DPI ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!(" {} ", prompt.input),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+        Line::raw("Type a value supported by the mouse (PIAO11 uses 50-DPI steps)."),
+    ];
+    if let Some(error) = &prompt.error {
+        lines.push(Line::from(vec![
+            Span::styled("error ", Style::default().fg(Color::Red)),
+            Span::raw(error),
+        ]));
+    } else {
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("enter", Style::default().fg(Color::Cyan)),
+        Span::raw(" set and verify  "),
+        Span::styled("esc", Style::default().fg(Color::Cyan)),
+        Span::raw(" cancel  "),
+        Span::styled("delete", Style::default().fg(Color::Cyan)),
+        Span::raw(" clear"),
+    ]));
+
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().title("DPI").borders(Borders::ALL)),
+        modal,
+    );
+}
+
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let width = area.width.saturating_mul(percent_x).saturating_div(100);
     Rect {
@@ -954,17 +1149,13 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Span::styled("r", Style::default().fg(Color::Cyan)),
         Span::raw(" refresh  "),
         Span::styled("up/down", Style::default().fg(Color::Cyan)),
-        Span::raw(" or "),
-        Span::styled("j/k", Style::default().fg(Color::Cyan)),
         Span::raw(" device  "),
         Span::styled("left/right", Style::default().fg(Color::Cyan)),
-        Span::raw(" or "),
-        Span::styled("h/l", Style::default().fg(Color::Cyan)),
         Span::raw(" rate  "),
         Span::styled("enter", Style::default().fg(Color::Cyan)),
-        Span::raw(" set  "),
-        Span::styled("space", Style::default().fg(Color::Cyan)),
-        Span::raw(" sync"),
+        Span::raw(" set rate  "),
+        Span::styled("d", Style::default().fg(Color::Cyan)),
+        Span::raw(" dpi"),
     ]);
 
     let focus = if app.focused { "focused" } else { "unfocused" };
@@ -1028,6 +1219,24 @@ mod tests {
         });
 
         assert_eq!(app.refresh_interval(), PENDING_RETRY_INTERVAL);
+    }
+
+    #[test]
+    fn dpi_prompt_replaces_current_value_on_first_digit() {
+        let mut app = TuiApp::new();
+        app.dpi_prompt = Some(DpiPrompt {
+            current: 800,
+            input: "800".to_string(),
+            error: None,
+            replace_on_input: true,
+        });
+
+        app.push_dpi_digit('3');
+        app.push_dpi_digit('2');
+        app.push_dpi_digit('0');
+        app.push_dpi_digit('0');
+
+        assert_eq!(app.dpi_prompt.as_ref().unwrap().input, "3200");
     }
 
     #[cfg(target_os = "linux")]

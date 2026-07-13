@@ -402,6 +402,14 @@ impl ProtocolKind {
             Self::LogitechHidpp | Self::RazerV1 { .. } => false,
         }
     }
+
+    pub const fn supports_battery_read(self) -> bool {
+        !matches!(self, Self::Eeprom16)
+    }
+
+    pub const fn supports_dpi(self) -> bool {
+        matches!(self, Self::Eeprom16 | Self::IpiPixV1 { .. })
+    }
 }
 
 impl fmt::Display for ProtocolKind {

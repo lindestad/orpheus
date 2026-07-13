@@ -218,18 +218,21 @@ fn set_dpi(dpi: u16, interface: Option<i32>) -> Result<()> {
     let before = device.read_dpi().ok();
     device.set_dpi(dpi)?;
     thread::sleep(Duration::from_millis(80));
-    let after = device.read_dpi().ok();
+    let after = device
+        .read_dpi()
+        .map_err(|err| anyhow!("set DPI to {dpi}, but readback failed: {err}"))?;
+    if after != dpi {
+        bail!("DPI verification failed: requested {dpi}, device reports {after}");
+    }
 
     println!(
-        "{} {} DPI: {} -> {}",
+        "{} {} DPI: {} -> {} (verified)",
         device.model().name,
         device.connection(),
         before
             .map(|dpi| dpi.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
         after
-            .map(|dpi| dpi.to_string())
-            .unwrap_or_else(|| dpi.to_string())
     );
     Ok(())
 }
