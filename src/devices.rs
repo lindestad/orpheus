@@ -404,7 +404,7 @@ impl ProtocolKind {
     }
 
     pub const fn supports_battery_read(self) -> bool {
-        !matches!(self, Self::Eeprom16)
+        true
     }
 
     pub const fn supports_dpi(self) -> bool {
@@ -1062,6 +1062,12 @@ pub fn build_eeprom16_get_rate() -> [u8; 16] {
     build_eeprom16_read(0, 2).expect("valid eeprom16 rate read")
 }
 
+pub fn build_eeprom16_get_battery() -> [u8; 16] {
+    let mut report = [0; 16];
+    report[0] = 4;
+    report
+}
+
 pub fn build_eeprom16_set_rate(rate: PollingRate) -> [u8; 16] {
     let code = rate.eeprom16_code();
     build_eeprom16_write(0, &[code, eeprom16_value_checksum(code)])
@@ -1395,6 +1401,10 @@ mod tests {
     fn builds_eeprom16_rate_reports() {
         let report = build_eeprom16_set_rate(PollingRate::Hz8000);
         assert_eq!(&report[0..7], &[7, 0, 0, 0, 2, 64, 21]);
+
+        let battery = build_eeprom16_get_battery();
+        assert_eq!(battery[0], 4);
+        assert!(battery[1..].iter().all(|byte| *byte == 0));
     }
 
     #[test]

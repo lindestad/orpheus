@@ -10,7 +10,7 @@ This is an early working prototype. It has been tested against:
 
 - G-Wolves Fenrir receiver `33e4:3517`, including rate read/write and battery level/status.
 - IPI Piao wireless receiver `372e:1014`, including rate read/write and battery level.
-- Compx PIAO11 `3554:f514`, including report8 rate read and DPI write on HID interface 1.
+- Compx PIAO11 `3554:f514`, including report8 rate, battery/charging telemetry, and DPI write on HID interface 1.
 
 Supported model IDs currently cover known Fenrir, Fenrir Pro, and Fenir Max wired/receiver IDs from G-Wolves WebHID protocol data, plus IPI Piao/Float-style PIX v1 mouse IDs from `https://shan.ipigame.cn/devices`.
 Compx-branded PIAO11 devices seen as `3554:f514` use the 16-byte report8 EEPROM path exposed by their vendor-control HID interface.

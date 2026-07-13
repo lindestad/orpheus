@@ -5,12 +5,13 @@ use anyhow::{Result, anyhow};
 use crate::devices::{
     BatteryStatus, ConnectionKind, DpiConfig, EEPROM16_DPI_ENTRY_LEN, EEPROM16_DPI_TABLE_OFFSET,
     EEPROM16_MAX_TRANSFER_LEN, IPI_PIX_DPI_COLOR_BYTES, IPI_PIX_DPI_LEVELS, ModelInfo, PollingRate,
-    ProtocolKind, build_eeprom16_dpi_entry, build_eeprom16_get_rate, build_eeprom16_read,
-    build_eeprom16_set_rate, build_eeprom16_write, build_feature64_get_battery,
-    build_feature64_get_rate, build_feature64_set_rate, build_ipi_pix_v1_get_basic_info,
-    build_ipi_pix_v1_get_dpi_config, build_ipi_pix_v1_get_rate, build_ipi_pix_v1_set_current_dpi,
-    build_ipi_pix_v1_set_rate, eeprom16_block_checksum, eeprom16_raw_to_dpi,
-    gwolves_charge_state_from_status, ipi_pix_v1_rate_from_sensor_byte, ipi_pix_v1_raw_to_dpi,
+    ProtocolKind, build_eeprom16_dpi_entry, build_eeprom16_get_battery, build_eeprom16_get_rate,
+    build_eeprom16_read, build_eeprom16_set_rate, build_eeprom16_write,
+    build_feature64_get_battery, build_feature64_get_rate, build_feature64_set_rate,
+    build_ipi_pix_v1_get_basic_info, build_ipi_pix_v1_get_dpi_config, build_ipi_pix_v1_get_rate,
+    build_ipi_pix_v1_set_current_dpi, build_ipi_pix_v1_set_rate, eeprom16_block_checksum,
+    eeprom16_raw_to_dpi, gwolves_charge_state_from_status, ipi_pix_v1_rate_from_sensor_byte,
+    ipi_pix_v1_raw_to_dpi,
 };
 
 const DEFAULT_PROFILE: u8 = 1;
@@ -97,12 +98,10 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
     pub fn read_battery(&self) -> Result<BatteryStatus> {
         match self.protocol {
             ProtocolKind::Feature64 { .. } => self.read_feature64_battery(),
+            ProtocolKind::Eeprom16 => self.read_eeprom16_battery(),
             ProtocolKind::IpiPixV1 { .. } => self.read_ipi_pix_v1_battery(),
             ProtocolKind::LogitechHidpp => self.read_logitech_hidpp_battery(),
             ProtocolKind::RazerV1 { .. } => self.read_razer_v1_battery(),
-            ProtocolKind::Eeprom16 => Err(anyhow!(
-                "battery telemetry is not implemented for report8 eeprom protocol"
-            )),
         }
     }
 
@@ -233,6 +232,29 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
         Ok(())
     }
 
+    fn read_eeprom16_battery(&self) -> Result<BatteryStatus> {
+        let response = self.transact_report8(build_eeprom16_get_battery(), 4, 50, 5)?;
+        let level = response
+            .get(5)
+            .copied()
+            .ok_or_else(|| anyhow!("short report8 response while reading battery level"))?
+            .min(100);
+        let raw_state = response
+            .get(6)
+            .copied()
+            .ok_or_else(|| anyhow!("short report8 response while reading charging state"))?;
+        let charge_state = match raw_state {
+            0 => crate::devices::ChargeState::Discharging,
+            1 => crate::devices::ChargeState::Charging,
+            raw => crate::devices::ChargeState::Raw(raw),
+        };
+        Ok(BatteryStatus::with_raw_state(
+            level,
+            charge_state,
+            raw_state,
+        ))
+    }
+
     fn read_eeprom16_dpi(&self) -> Result<u16> {
         let (active_index, dpi_levels) = self.read_eeprom16_dpi_config()?;
         dpi_levels
@@ -248,7 +270,17 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
             .checked_add((active_index as u8).saturating_mul(EEPROM16_DPI_ENTRY_LEN))
             .ok_or_else(|| anyhow!("report8 DPI table offset overflow"))?;
         let report = build_eeprom16_write(offset, &entry)?;
-        let _ = self.transact_report8(report, 7, 50, 5)?;
+        if let Err(write_error) = self.transact_report8(report, 7, 50, 5) {
+            return match self.read_eeprom16_dpi() {
+                Ok(after) if after == dpi => Ok(()),
+                Ok(after) => Err(anyhow!(
+                    "{write_error}; active DPI readback is {after}, expected {dpi}"
+                )),
+                Err(read_error) => Err(anyhow!(
+                    "{write_error}; active DPI readback failed: {read_error}"
+                )),
+            };
+        }
         Ok(())
     }
 
@@ -263,22 +295,18 @@ impl<'a, T: DeviceTransport + ?Sized> ProtocolDevice<'a, T> {
             return Err(anyhow!("device returned zero report8 DPI levels"));
         }
 
-        let raw_active = usize::from(
+        let active_index = usize::from(
             *header
                 .get(4)
                 .ok_or_else(|| anyhow!("short report8 header while reading active DPI level"))?,
         );
-        let active_index = if (1..=level_count).contains(&raw_active) {
-            raw_active - 1
-        } else if raw_active < level_count {
-            raw_active
-        } else {
+        if active_index >= level_count {
             return Err(anyhow!(
                 "device active report8 DPI level {} is outside {} configured level(s)",
-                raw_active,
+                active_index,
                 level_count
             ));
-        };
+        }
 
         let table_len = level_count
             .checked_mul(usize::from(EEPROM16_DPI_ENTRY_LEN))
@@ -1109,6 +1137,41 @@ mod tests {
     }
 
     #[test]
+    fn simulated_eeprom_battery_reads_level_and_charging_state() {
+        let mut response = vec![0; REPORT8_PAYLOAD_LEN];
+        response[0] = 4;
+        response[4] = 2;
+        response[5] = 15;
+        response[6] = 0;
+        response[7] = 0x0f;
+        response[8] = 0x7c;
+        let transport = ScriptedTransport {
+            feature_reads: RefCell::new(VecDeque::new()),
+            feature_writes: RefCell::new(Vec::new()),
+            input_reads: RefCell::new(VecDeque::from([Vec::new(), response])),
+            output_writes: RefCell::new(Vec::new()),
+        };
+        let protocol = ProtocolDevice::new(
+            &transport,
+            &TEST_MODEL,
+            ConnectionKind::Receiver,
+            ProtocolKind::Eeprom16,
+        );
+
+        let battery = protocol.read_battery().unwrap();
+        assert_eq!(battery.level_percent, Some(15));
+        assert_eq!(
+            battery.charge_state,
+            crate::devices::ChargeState::Discharging
+        );
+        assert_eq!(battery.raw_state, Some(0));
+        let writes = transport.output_writes.borrow();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, REPORT8_ID);
+        assert_eq!(writes[0].1[0], 4);
+    }
+
+    #[test]
     fn simulated_eeprom_dpi_read_uses_active_level() {
         let transport = ScriptedTransport {
             feature_reads: RefCell::new(VecDeque::new()),
@@ -1130,7 +1193,7 @@ mod tests {
             ProtocolKind::Eeprom16,
         );
 
-        assert_eq!(protocol.read_dpi().unwrap(), 800);
+        assert_eq!(protocol.read_dpi().unwrap(), 1200);
     }
 
     #[test]
@@ -1160,7 +1223,52 @@ mod tests {
         protocol.set_dpi(3200).unwrap();
         let writes = transport.output_writes.borrow();
         assert_eq!(writes.len(), 4);
-        assert_eq!(&writes[3].1[0..9], &[7, 0, 0, 12, 4, 63, 63, 0, 215]);
+        assert_eq!(&writes[3].1[0..9], &[7, 0, 0, 16, 4, 63, 63, 0, 215]);
+    }
+
+    #[test]
+    fn simulated_eeprom_dpi_set_accepts_matching_readback_after_missing_ack() {
+        let header = &[1, 0x54, 1, 0x54, 0, 0x55];
+        let transport = ScriptedTransport {
+            feature_reads: RefCell::new(VecDeque::new()),
+            feature_writes: RefCell::new(Vec::new()),
+            input_reads: RefCell::new(VecDeque::from([
+                Vec::new(),
+                report8_response(0, header),
+                Vec::new(),
+                report8_response(12, &[0x0f, 0x0f, 0, 0x37]),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                report8_response(0, header),
+                Vec::new(),
+                report8_response(12, &[0x3f, 0x3f, 0, 0xd7]),
+            ])),
+            output_writes: RefCell::new(Vec::new()),
+        };
+        let protocol = ProtocolDevice::new(
+            &transport,
+            &TEST_MODEL,
+            ConnectionKind::Wired,
+            ProtocolKind::Eeprom16,
+        );
+
+        protocol.set_dpi(3200).unwrap();
+        let writes = transport.output_writes.borrow();
+        let dpi_writes = writes
+            .iter()
+            .filter(|(_, payload)| payload.first() == Some(&7))
+            .collect::<Vec<_>>();
+        assert_eq!(dpi_writes.len(), 5);
+        assert!(
+            dpi_writes
+                .iter()
+                .all(|(_, payload)| payload[3] == 12 && payload[5] == 0x3f)
+        );
     }
 
     #[test]
