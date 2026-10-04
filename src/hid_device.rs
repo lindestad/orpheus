@@ -141,6 +141,12 @@ impl HidPollMonitor {
         Ok(Self { api })
     }
 
+    pub fn refresh_devices(&mut self) -> Result<()> {
+        self.api
+            .refresh_devices()
+            .context("failed to refresh HID device list")
+    }
+
     pub fn scan(&self) -> Result<Vec<DeviceSnapshot>> {
         let mut devices = Vec::new();
         let mut seen_paths = HashSet::new();

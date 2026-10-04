@@ -137,7 +137,9 @@ struct OrpheusGui {
     devices: Vec<DeviceSnapshot>,
     selected_device: Option<GuiDeviceKey>,
     targets: HashMap<GuiDeviceKey, PollingRate>,
+    pending_rates: HashMap<GuiDeviceKey, PollingRate>,
     status: String,
+    rate_status: Option<String>,
     last_error: Option<String>,
     last_refresh: Option<Instant>,
 }
@@ -149,11 +151,13 @@ impl OrpheusGui {
 
         Self {
             options,
-            worker: GuiWorker::spawn(),
+            worker: GuiWorker::spawn(cc.egui_ctx.clone()),
             devices: Vec::new(),
             selected_device: None,
             targets: HashMap::new(),
+            pending_rates: HashMap::new(),
             status: "Scanning for supported devices".to_string(),
+            rate_status: None,
             last_error: None,
             last_refresh: None,
         }
@@ -174,8 +178,17 @@ impl OrpheusGui {
                         format!("{} supported device(s)", self.devices.len())
                     };
                 }
-                WorkerEvent::Status(message) => {
-                    self.status = message;
+                WorkerEvent::RateStatus {
+                    key,
+                    pending,
+                    message,
+                } => {
+                    if let Some(rate) = pending {
+                        self.pending_rates.insert(key, rate);
+                    } else {
+                        self.pending_rates.remove(&key);
+                    }
+                    self.rate_status = Some(message);
                 }
                 WorkerEvent::Error(message) => {
                     self.last_error = Some(message.clone());
@@ -270,7 +283,7 @@ impl eframe::App for OrpheusGui {
                 });
 
                 ui.add_space(22.0);
-                let body_height = (ui.available_height() - 36.0).max(260.0);
+                let body_height = (ui.available_height() - 44.0).max(0.0);
                 ui.horizontal(|ui| {
                     ui.allocate_ui_with_layout(
                         Vec2::new(286.0, body_height),
@@ -305,15 +318,33 @@ impl eframe::App for OrpheusGui {
 
 fn status_bar(ui: &mut egui::Ui, app: &OrpheusGui) {
     ui.horizontal(|ui| {
+        let refresh = refresh_text(app.last_refresh);
+        let refresh_width = ui.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(refresh.clone(), TextStyle::Body.resolve(ui.style()), MUTED)
+                .size()
+                .x
+        });
         let status_color = if app.last_error.is_some() {
             ERROR
         } else {
             MUTED
         };
-        ui.label(RichText::new(&app.status).color(status_color));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(refresh_text(app.last_refresh)).color(MUTED));
-        });
+        let status = if app.last_error.is_some() {
+            &app.status
+        } else {
+            app.rate_status.as_ref().unwrap_or(&app.status)
+        };
+        ui.add_sized(
+            [
+                (ui.available_width() - refresh_width - ui.spacing().item_spacing.x).max(0.0),
+                20.0,
+            ],
+            egui::Label::new(RichText::new(status).color(status_color))
+                .wrap_mode(egui::TextWrapMode::Truncate),
+        )
+        .on_hover_text(status);
+        ui.label(RichText::new(refresh).color(MUTED));
     });
 }
 
@@ -370,12 +401,11 @@ fn draw_device_sidebar(ui: &mut egui::Ui, app: &mut OrpheusGui) {
                                             .color(MUTED),
                                         );
                                     });
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        status_badge(ui, device);
-                                    });
                                 });
+                                status_badge(ui, device);
                             })
-                            .response;
+                            .response
+                            .interact(egui::Sense::click());
                         if response.clicked() {
                             app.selected_device = Some(key);
                         }
@@ -392,109 +422,137 @@ fn draw_device_detail(ui: &mut egui::Ui, app: &mut OrpheusGui) {
     };
 
     let key = GuiDeviceKey::from_snapshot(&device);
-    let target = app.target_for(&device);
+    let mut target = app.target_for(&device);
 
-    Frame::new()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::same(20))
+    ScrollArea::vertical()
+        .id_salt("device-detail")
+        .auto_shrink([false, false])
+        .max_height(ui.available_height())
         .show(ui, |ui| {
-            ui.set_min_height(ui.available_height());
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(format!("{} {}", device.vendor_name, device.model_name))
-                            .size(22.0)
-                            .strong()
-                            .color(TEXT),
-                    );
-                    ui.label(
-                        RichText::new(device.protocol.to_string())
-                            .monospace()
-                            .color(MUTED),
-                    );
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    status_badge(ui, &device);
-                });
-            });
-
-            ui.add_space(18.0);
-            ui.columns(3, |columns| {
-                metric(
-                    &mut columns[0],
-                    "Current",
-                    rate_text(device.current_rate, device.cached_rate),
-                );
-                metric(&mut columns[1], "Battery", battery_summary(&device));
-                metric(
-                    &mut columns[2],
-                    "Mode",
-                    format!(
-                        "{:04x}:{:04x} {}",
-                        device.vid, device.pid, device.connection
-                    ),
-                );
-            });
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.add_space(18.0);
-
-            ui.label(RichText::new("Target Rate").strong().color(TEXT));
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                for rate in &device.supported_rates {
-                    let selected = target == Some(*rate);
-                    let label = RichText::new(format!("{} Hz", rate.hz()))
-                        .monospace()
-                        .color(if selected { BG } else { TEXT });
-                    let button = Button::new(label)
-                        .fill(if selected { ACCENT } else { SUBTLE })
-                        .stroke(Stroke::new(1.0, if selected { ACCENT } else { BORDER }));
-                    let response = ui.add_sized([82.0, 34.0], button);
-                    if response.clicked() {
-                        app.targets.insert(key, *rate);
-                    }
-                }
-            });
-
-            ui.add_space(18.0);
-            ui.horizontal(|ui| {
-                let can_set = target.is_some() && device.current_rate != target;
-                let label = target
-                    .map(|rate| format!("Set {} Hz", rate.hz()))
-                    .unwrap_or_else(|| "Set rate".to_string());
-                if ui
-                    .add_enabled(can_set, Button::new(RichText::new(label).strong()))
-                    .clicked()
-                    && let Some(rate) = target
-                {
-                    app.worker.send(WorkerCommand::SetRate {
-                        vid: device.vid,
-                        pid: device.pid,
-                        rate,
+            Frame::new()
+                .fill(SURFACE)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(20))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} {}",
+                                    device.vendor_name, device.model_name
+                                ))
+                                .size(22.0)
+                                .strong()
+                                .color(TEXT),
+                            );
+                            ui.label(
+                                RichText::new(device.protocol.to_string())
+                                    .monospace()
+                                    .color(MUTED),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            status_badge(ui, &device);
+                        });
                     });
-                    app.status =
-                        format!("Queued {} for {:04x}:{:04x}", rate, device.vid, device.pid);
-                }
-                if device.current_rate == target {
-                    ui.label(RichText::new("Already at target").color(MUTED));
-                } else if device.cached_rate || device.current_rate.is_none() {
-                    ui.label(RichText::new("Will retry when the device answers").color(MUTED));
-                }
-            });
 
-            if let Some(error) = &device.read_error {
-                ui.add_space(16.0);
-                error_line(ui, "Read error", error);
-            }
-            if let Some(error) = &device.battery_error {
-                ui.add_space(8.0);
-                error_line(ui, "Battery error", error);
-            }
+                    ui.add_space(18.0);
+                    ui.columns(3, |columns| {
+                        metric(
+                            &mut columns[0],
+                            "Current",
+                            rate_text(device.current_rate, device.cached_rate),
+                        );
+                        metric(&mut columns[1], "Battery", battery_summary(&device));
+                        metric(
+                            &mut columns[2],
+                            "Mode",
+                            format!(
+                                "{:04x}:{:04x} {}",
+                                device.vid, device.pid, device.connection
+                            ),
+                        );
+                    });
+
+                    ui.add_space(20.0);
+                    ui.separator();
+                    ui.add_space(18.0);
+
+                    ui.label(RichText::new("Target Rate").strong().color(TEXT));
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for rate in &device.supported_rates {
+                            let selected = target == Some(*rate);
+                            let label = RichText::new(format!("{} Hz", rate.hz()))
+                                .monospace()
+                                .color(if selected { BG } else { TEXT });
+                            let button = Button::new(label)
+                                .fill(if selected { ACCENT } else { SUBTLE })
+                                .stroke(Stroke::new(1.0, if selected { ACCENT } else { BORDER }));
+                            let response = ui.add_sized([82.0, 34.0], button);
+                            if response.clicked() {
+                                app.targets.insert(key, *rate);
+                                target = Some(*rate);
+                            }
+                        }
+                    });
+
+                    ui.add_space(18.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let pending = app.pending_rates.get(&key).copied();
+                        let can_set = can_set_rate(&device, target, pending);
+                        let label = target
+                            .map(|rate| format!("Set {} Hz", rate.hz()))
+                            .unwrap_or_else(|| "Set rate".to_string());
+                        if ui
+                            .add_enabled(
+                                can_set,
+                                Button::new(RichText::new(label).strong().color(TEXT)),
+                            )
+                            .clicked()
+                            && let Some(rate) = target
+                        {
+                            app.worker.send(WorkerCommand::SetRate { key, rate });
+                            app.pending_rates.insert(key, rate);
+                            app.rate_status = Some(format!(
+                                "Queued {} for {:04x}:{:04x}",
+                                rate, device.vid, device.pid
+                            ));
+                        }
+                        if let Some(rate) = pending {
+                            ui.label(RichText::new(format!("Queued {rate}")).color(MUTED));
+                        } else if device.current_rate == target && !device.cached_rate {
+                            ui.label(RichText::new("Already at target").color(MUTED));
+                        } else if device.protocol.supports_rate_read()
+                            && (device.cached_rate || device.current_rate.is_none())
+                        {
+                            ui.label(
+                                RichText::new("Will retry when the device answers").color(MUTED),
+                            );
+                        }
+                    });
+
+                    if let Some(error) = &device.read_error {
+                        ui.add_space(16.0);
+                        error_line(ui, "Read error", error);
+                    }
+                    if let Some(error) = &device.battery_error {
+                        ui.add_space(8.0);
+                        error_line(ui, "Battery error", error);
+                    }
+                });
         });
+}
+
+fn can_set_rate(
+    device: &DeviceSnapshot,
+    target: Option<PollingRate>,
+    pending: Option<PollingRate>,
+) -> bool {
+    target.is_some()
+        && target != pending
+        && (device.cached_rate || device.current_rate != target || pending.is_some())
 }
 
 fn metric(ui: &mut egui::Ui, label: &str, value: String) {
@@ -554,7 +612,7 @@ fn error_line(ui: &mut egui::Ui, label: &str, message: &str) {
 }
 
 fn geist_button(label: &str) -> Button<'_> {
-    Button::new(RichText::new(label).strong())
+    Button::new(RichText::new(label).strong().color(TEXT))
         .fill(SURFACE)
         .stroke(Stroke::new(1.0, BORDER))
 }
@@ -679,10 +737,10 @@ struct GuiWorker {
 }
 
 impl GuiWorker {
-    fn spawn() -> Self {
+    fn spawn(ctx: egui::Context) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
-        let handle = thread::spawn(move || worker_loop(command_rx, event_tx));
+        let handle = thread::spawn(move || worker_loop(command_rx, event_tx, ctx));
         Self {
             commands: command_tx,
             events: event_rx,
@@ -708,8 +766,7 @@ impl Drop for GuiWorker {
 enum WorkerCommand {
     Refresh,
     SetRate {
-        vid: u16,
-        pid: u16,
+        key: GuiDeviceKey,
         rate: PollingRate,
     },
     Shutdown,
@@ -721,53 +778,62 @@ enum WorkerEvent {
         devices: Vec<DeviceSnapshot>,
         at: Instant,
     },
-    Status(String),
+    RateStatus {
+        key: GuiDeviceKey,
+        pending: Option<PollingRate>,
+        message: String,
+    },
     Error(String),
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PendingWorkerRate {
-    vid: u16,
-    pid: u16,
-    rate: PollingRate,
-}
-
-fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
-    let monitor = match HidPollMonitor::new() {
+fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>, ctx: egui::Context) {
+    let mut monitor = match HidPollMonitor::new() {
         Ok(monitor) => monitor,
         Err(err) => {
             let _ = events.send(WorkerEvent::Error(format!(
                 "failed to initialize HID: {err}"
             )));
+            ctx.request_repaint();
             return;
         }
     };
     let mut cache = DeviceSnapshotCache::default();
-    let mut pending_rate = None;
-    scan_and_send(&monitor, &mut cache, &events);
+    let mut pending_rates = HashMap::new();
+    scan_and_send(&mut monitor, &mut cache, &events, &mut pending_rates);
+    ctx.request_repaint();
 
     loop {
         match commands.recv_timeout(REFRESH_INTERVAL) {
-            Ok(WorkerCommand::Refresh) => scan_and_send(&monitor, &mut cache, &events),
-            Ok(WorkerCommand::SetRate { vid, pid, rate }) => {
-                pending_rate = Some(PendingWorkerRate { vid, pid, rate });
-                try_pending_rate(&monitor, &events, &mut pending_rate);
-                scan_and_send(&monitor, &mut cache, &events);
+            Ok(WorkerCommand::Refresh) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(WorkerCommand::SetRate { key, rate }) => {
+                pending_rates.insert(key, rate);
             }
             Ok(WorkerCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {
-                try_pending_rate(&monitor, &events, &mut pending_rate);
-                scan_and_send(&monitor, &mut cache, &events);
-            }
         }
+        scan_and_send(&mut monitor, &mut cache, &events, &mut pending_rates);
+        ctx.request_repaint();
     }
 }
 
 fn scan_and_send(
-    monitor: &HidPollMonitor,
+    monitor: &mut HidPollMonitor,
     cache: &mut DeviceSnapshotCache,
     events: &Sender<WorkerEvent>,
+    pending_rates: &mut HashMap<GuiDeviceKey, PollingRate>,
 ) {
+    if let Err(err) = monitor.refresh_devices() {
+        let _ = events.send(WorkerEvent::Error(format!("device refresh failed: {err}")));
+        return;
+    }
+    try_pending_rates(events, pending_rates, |key, rate| {
+        let device = monitor.open_by_vid_pid(key.vid, key.pid)?;
+        device.set_rate(rate)?;
+        verify_rate_write(rate, device.supports_rate_read(), || {
+            thread::sleep(Duration::from_millis(80));
+            device.read_rate()
+        })?;
+        Ok(device.supports_rate_read())
+    });
     match monitor.scan() {
         Ok(mut devices) => {
             cache.apply(&mut devices);
@@ -782,52 +848,280 @@ fn scan_and_send(
     }
 }
 
-fn try_pending_rate(
-    monitor: &HidPollMonitor,
+fn try_pending_rates(
     events: &Sender<WorkerEvent>,
-    pending_rate: &mut Option<PendingWorkerRate>,
+    pending_rates: &mut HashMap<GuiDeviceKey, PollingRate>,
+    mut apply: impl FnMut(GuiDeviceKey, PollingRate) -> Result<bool>,
 ) {
-    let Some(pending) = *pending_rate else {
-        return;
-    };
+    pending_rates.retain(|key, rate| {
+        let result = apply(*key, *rate);
+        let (pending, message) = rate_write_status(*key, *rate, result);
+        let _ = events.send(WorkerEvent::RateStatus {
+            key: *key,
+            pending,
+            message,
+        });
+        pending.is_some()
+    });
+}
 
-    match monitor.open_by_vid_pid(pending.vid, pending.pid) {
-        Ok(device) => {
-            if let Err(err) = device.set_rate(pending.rate) {
-                let _ = events.send(WorkerEvent::Status(format!(
-                    "Queued {} for {:04x}:{:04x}: {err}",
-                    pending.rate, pending.vid, pending.pid
-                )));
-                return;
-            }
-            thread::sleep(Duration::from_millis(80));
-            match device.read_rate() {
-                Ok(after) if after == pending.rate => {
-                    *pending_rate = None;
-                    let _ = events.send(WorkerEvent::Status(format!(
-                        "Set {:04x}:{:04x} to {after}",
-                        pending.vid, pending.pid
-                    )));
-                }
-                Ok(after) => {
-                    let _ = events.send(WorkerEvent::Status(format!(
-                        "Queued {} for {:04x}:{:04x}; device is still {after}",
-                        pending.rate, pending.vid, pending.pid
-                    )));
-                }
-                Err(err) => {
-                    let _ = events.send(WorkerEvent::Status(format!(
-                        "Queued {} for {:04x}:{:04x}: {err}",
-                        pending.rate, pending.vid, pending.pid
-                    )));
-                }
-            }
+fn verify_rate_write(
+    target: PollingRate,
+    supports_rate_read: bool,
+    read_rate: impl FnOnce() -> Result<PollingRate>,
+) -> Result<()> {
+    if supports_rate_read {
+        let after = read_rate()?;
+        anyhow::ensure!(after == target, "device is still {after}");
+    }
+    Ok(())
+}
+
+fn rate_write_status(
+    key: GuiDeviceKey,
+    rate: PollingRate,
+    result: Result<bool>,
+) -> (Option<PollingRate>, String) {
+    match result {
+        Ok(true) => (
+            None,
+            format!("Set {:04x}:{:04x} to {rate}", key.vid, key.pid),
+        ),
+        Ok(false) => (
+            None,
+            format!(
+                "Sent {rate} to {:04x}:{:04x}; current-rate verification unavailable",
+                key.vid, key.pid
+            ),
+        ),
+        Err(err) => (
+            Some(rate),
+            format!("Queued {rate} for {:04x}:{:04x}: {err}", key.vid, key.pid),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::find_model;
+
+    fn snapshot(vid: u16, pid: u16) -> DeviceSnapshot {
+        let (model, connection) = find_model(vid, pid).unwrap();
+        DeviceSnapshot {
+            path: format!("{vid:04x}:{pid:04x}"),
+            vid,
+            pid,
+            product_name: None,
+            vendor_name: model.vendor_name,
+            model_name: model.name,
+            connection,
+            protocol: model.protocol,
+            supported_rates: model.supported_rates(connection).to_vec(),
+            current_rate: Some(PollingRate::Hz1000),
+            battery: None,
+            cached_rate: false,
+            cached_battery: false,
+            battery_error: None,
+            read_error: None,
         }
-        Err(err) => {
-            let _ = events.send(WorkerEvent::Status(format!(
-                "Queued {} for {:04x}:{:04x}: {err}",
-                pending.rate, pending.vid, pending.pid
-            )));
+    }
+
+    fn app() -> (OrpheusGui, Sender<WorkerEvent>) {
+        let (commands, _) = mpsc::channel();
+        let (events, receiver) = mpsc::channel();
+        let mut app = OrpheusGui {
+            options: GuiOptions::default(),
+            worker: GuiWorker {
+                commands,
+                events: receiver,
+                handle: None,
+            },
+            devices: vec![snapshot(0x372e, 0x1014), snapshot(0x33e4, 0x3517)],
+            selected_device: None,
+            targets: HashMap::new(),
+            pending_rates: HashMap::new(),
+            status: String::new(),
+            rate_status: None,
+            last_error: None,
+            last_refresh: None,
+        };
+        app.reconcile_selection();
+        app.reconcile_targets();
+        (app, events)
+    }
+
+    #[test]
+    fn clicking_a_device_row_selects_it() {
+        let (mut app, _) = app();
+        let ctx = egui::Context::default();
+        let draw = |app: &mut OrpheusGui, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(300.0, 500.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| draw_device_sidebar(ui, app),
+            )
+        };
+        let output = draw(&mut app, vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text().contains("Fenrir") => {
+                    Some(text.pos + text.galley.rect.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("second device label must be visible");
+        let _ = draw(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(
+            app.selected_device,
+            Some(GuiDeviceKey::from_snapshot(&app.devices[1]))
+        );
+    }
+
+    #[test]
+    fn snapshots_preserve_rate_change_status() {
+        let (mut app, events) = app();
+        let message = "Queued 4000 Hz for sleeping mouse";
+        events
+            .send(WorkerEvent::RateStatus {
+                key: GuiDeviceKey::from_snapshot(&app.devices[0]),
+                pending: Some(PollingRate::Hz4000),
+                message: message.to_string(),
+            })
+            .unwrap();
+        events
+            .send(WorkerEvent::Snapshot {
+                devices: app.devices.clone(),
+                at: Instant::now(),
+            })
+            .unwrap();
+        app.drain_worker_events();
+        assert_eq!(app.rate_status.as_deref(), Some(message));
+    }
+
+    #[test]
+    fn cached_rate_does_not_disable_setting_the_same_target() {
+        let mut device = snapshot(0x33e4, 0x3517);
+        let target = Some(PollingRate::Hz1000);
+        assert!(!can_set_rate(&device, target, None));
+        device.cached_rate = true;
+        assert!(can_set_rate(&device, target, None));
+        assert!(!can_set_rate(&device, target, target));
+        assert!(!can_set_rate(&device, None, None));
+        device.cached_rate = false;
+        assert!(can_set_rate(&device, target, Some(PollingRate::Hz4000)));
+    }
+
+    #[test]
+    fn write_only_protocol_does_not_attempt_verification() {
+        verify_rate_write(PollingRate::Hz1000, false, || {
+            panic!("a write-only protocol must not attempt a current-rate read")
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn readable_protocol_requires_the_requested_rate() {
+        assert!(
+            verify_rate_write(PollingRate::Hz4000, true, || { Ok(PollingRate::Hz1000) }).is_err()
+        );
+        assert!(
+            verify_rate_write(PollingRate::Hz4000, true, || {
+                Err(anyhow::anyhow!("sleeping"))
+            })
+            .is_err()
+        );
+        verify_rate_write(PollingRate::Hz4000, true, || Ok(PollingRate::Hz4000)).unwrap();
+    }
+
+    #[test]
+    fn pending_requests_are_independent_and_success_is_not_retried() {
+        let (app, events) = app();
+        let first = GuiDeviceKey::from_snapshot(&app.devices[0]);
+        let second = GuiDeviceKey::from_snapshot(&app.devices[1]);
+        let mut pending =
+            HashMap::from([(first, PollingRate::Hz4000), (second, PollingRate::Hz8000)]);
+        let mut attempted = Vec::new();
+        try_pending_rates(&events, &mut pending, |key, rate| {
+            attempted.push((key, rate));
+            if key == first {
+                Err(anyhow::anyhow!("sleeping"))
+            } else {
+                Ok(false)
+            }
+        });
+        assert_eq!(attempted.len(), 2);
+        assert_eq!(pending, HashMap::from([(first, PollingRate::Hz4000)]));
+        try_pending_rates(&events, &mut pending, |key, rate| {
+            assert_eq!((key, rate), (first, PollingRate::Hz4000));
+            Ok(true)
+        });
+        assert!(pending.is_empty());
+        try_pending_rates(&events, &mut pending, |_, _| {
+            panic!("successful writes must not repeat")
+        });
+    }
+
+    #[test]
+    fn long_errors_and_status_stay_within_their_panels() {
+        let (mut app, _) = app();
+        app.devices[0].read_error = Some("A sleeping device did not answer. ".repeat(50));
+        app.rate_status = Some("Queued rate change for a sleeping mouse. ".repeat(20));
+        let ctx = egui::Context::default();
+        install_geist_fonts(&ctx);
+        install_geist_style(&ctx);
+        for size in [Vec2::new(400.0, 300.0), Vec2::new(600.0, 450.0)] {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ui| {
+                    let max = ui.max_rect();
+                    draw_device_detail(ui, &mut app);
+                    assert!(ui.min_rect().max.y <= max.max.y + 1.0);
+                    assert!(ui.min_rect().max.x <= max.max.x + 1.0);
+                },
+            );
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ui| {
+                    let max = ui.max_rect();
+                    status_bar(ui, &app);
+                    assert!(ui.min_rect().max.x <= max.max.x + 1.0);
+                },
+            );
         }
     }
 }

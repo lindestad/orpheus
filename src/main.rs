@@ -95,10 +95,13 @@ fn main() -> Result<()> {
         Command::Gui {
             software_renderer,
             steady_repaint,
-        } => run_gui(GuiOptions {
-            software_renderer,
-            steady_repaint,
-        }),
+        } => {
+            detach_gui_console();
+            run_gui(GuiOptions {
+                software_renderer,
+                steady_repaint,
+            })
+        }
         Command::Tui => run_tui(),
         Command::List { json } => list_devices(json),
         Command::Diagnose { json } => diagnose_devices(json),
@@ -117,6 +120,20 @@ fn main() -> Result<()> {
             dry_run,
             once,
         } => watch(config.unwrap_or_else(default_config_path), dry_run, once),
+    }
+}
+
+fn detach_gui_console() {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn FreeConsole() -> i32;
+        }
+        // Keep CLI commands attached to their terminal, but close a GUI launcher's console.
+        unsafe {
+            FreeConsole();
+        }
     }
 }
 
