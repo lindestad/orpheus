@@ -34,6 +34,20 @@ Launch the native GUI:
 cargo run -- gui
 ```
 
+Install a release build for the current Windows user and open the GUI at sign-in:
+
+```powershell
+.\scripts\install-windows.ps1 -Startup
+```
+
+The installer puts the app under `%LOCALAPPDATA%\Programs\Orpheus` and adds a Start Menu shortcut. `-Startup` enables startup for the current user; updates without this flag preserve the existing startup choice. GUI launches do not keep a console window open.
+
+The GUI's Settings page controls Windows startup, starting minimized to the notification area, minimizing to the notification area, and closing to the notification area. Window preferences are saved in `%APPDATA%\Orpheus\gui.toml`. Startup uses the current user's Windows Run registry entry; the old Startup-folder shortcut is migrated automatically during installation or when changing the startup setting.
+
+On Windows, the notification icon's left click opens the app. Its right-click menu offers Open Orpheus, Settings, and Quit Orpheus. Quit always exits, even when closing the window is configured to hide it. If the notification icon cannot be created, the app keeps its window accessible and uses normal minimize/close behavior.
+
+Launching the GUI again restores the existing window instead of creating another app or notification icon.
+
 If NVIDIA G-SYNC/VRR captures the focused GUI window and drops the display refresh rate, try the software-rendering path first:
 
 ```powershell
@@ -158,6 +172,7 @@ For devices that report battery level but not charge state, the watcher treats `
 - The TUI and watcher query the configured polling rate through device control reports, not by sampling pointer movement.
 - The GUI is built with `eframe`/`egui` and does not bundle Chromium. It uses vendored Geist Sans/Mono font files under `assets/fonts`.
 - The GUI defaults to vsync presentation. `--software-renderer` asks wgpu for the Windows DX12 software/WARP adapter, and `--steady-repaint` keeps the focused GUI at 60 Hz for drivers that still apply windowed VRR.
+- The GUI refreshes device enumeration on each scan, keeps pending rate changes separately for each mouse, and reports a successful write without retrying when the protocol cannot read the current rate.
 - Device support is implemented as per-vendor protocol adapters under one HID monitor path.
 - The watcher scans processes at `scan_interval_ms`, with a minimum interval of 250 ms. HID control reads are less frequent unless a rate change is pending.
 - In first-device mode, the watcher writes only when the desired rule target changes.

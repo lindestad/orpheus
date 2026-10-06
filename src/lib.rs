@@ -1,6 +1,8 @@
 pub mod config;
+mod desktop;
 pub mod devices;
 pub mod gui;
+mod gui_settings;
 pub mod hid_device;
 pub mod process_rules;
 pub mod protocols;
