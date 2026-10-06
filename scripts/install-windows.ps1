@@ -9,6 +9,10 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $sourceExe = Join-Path $repoRoot 'target\release\orpheus.exe'
 $installDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\Orpheus'
 $installedExe = Join-Path $installDir 'orpheus.exe'
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$legacyStartup = Join-Path ([Environment]::GetFolderPath('Startup')) 'Orpheus.lnk'
+$existingStartup = Get-ItemProperty -LiteralPath $runKey -Name Orpheus -ErrorAction SilentlyContinue
+$enableStartup = $Startup -or ($null -ne $existingStartup) -or (Test-Path -LiteralPath $legacyStartup)
 
 if (-not $NoBuild) {
     Push-Location $repoRoot
@@ -30,7 +34,7 @@ if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
 $running = Get-Process -Name orpheus -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -eq $installedExe }
 if ($running) {
-    throw 'Close the installed Orpheus app before updating it.'
+    throw 'Quit the installed Orpheus app before updating it.'
 }
 
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
@@ -41,9 +45,6 @@ Copy-Item -LiteralPath (Join-Path $repoRoot 'assets\fonts\OFL.txt') -Destination
 
 $shell = New-Object -ComObject WScript.Shell
 $shortcutFolders = @([Environment]::GetFolderPath('Programs'))
-if ($Startup) {
-    $shortcutFolders += [Environment]::GetFolderPath('Startup')
-}
 foreach ($folder in $shortcutFolders) {
     $shortcut = $shell.CreateShortcut((Join-Path $folder 'Orpheus.lnk'))
     $shortcut.TargetPath = $installedExe
@@ -55,7 +56,15 @@ foreach ($folder in $shortcutFolders) {
     $shortcut.Save()
 }
 
+if ($enableStartup) {
+    New-Item -Path $runKey -Force | Out-Null
+    New-ItemProperty -LiteralPath $runKey -Name Orpheus -PropertyType String -Value "`"$installedExe`" gui" -Force | Out-Null
+    if (Test-Path -LiteralPath $legacyStartup) {
+        Remove-Item -LiteralPath $legacyStartup
+    }
+}
+
 Write-Output "Installed Orpheus to $installedExe"
-if ($Startup) {
+if ($enableStartup) {
     Write-Output 'Orpheus will open at Windows sign-in for the current user.'
 }

@@ -21,7 +21,9 @@ use eframe::{
 };
 
 use crate::{
+    desktop::{self, Tray, TrayAction},
     devices::{BatteryStatus, ChargeState, ConnectionKind, PollingRate},
+    gui_settings::GuiSettings,
     hid_device::{DeviceSnapshot, DeviceSnapshotCache, HidPollMonitor},
 };
 
@@ -44,11 +46,27 @@ pub struct GuiOptions {
 
 pub fn run_gui(gui_options: GuiOptions) -> Result<()> {
     #[cfg(windows)]
+    let Some(instance) = desktop::Instance::acquire()? else {
+        return Ok(());
+    };
+    #[cfg(windows)]
+    let open_request = Some(instance.open_request());
+    #[cfg(not(windows))]
+    let open_request = None;
+    #[cfg(windows)]
     set_windows_app_id()?;
+    let settings_path = GuiSettings::path()?;
+    let (settings, settings_error) = match GuiSettings::load(&settings_path) {
+        Ok(settings) => (settings, None),
+        Err(err) => (GuiSettings::default(), Some(format!("{err:#}"))),
+    };
     let native_options = eframe::NativeOptions {
+        #[cfg(windows)]
+        event_loop_builder: Some(instance.event_loop_hook()),
         viewport: ViewportBuilder::default()
             .with_title("Orpheus")
             .with_icon(app_icon()?)
+            .with_visible(!(cfg!(windows) && settings.start_minimized))
             .with_inner_size([960.0, 640.0])
             .with_min_inner_size([760.0, 500.0]),
         wgpu_options: gui_wgpu_options(gui_options),
@@ -58,7 +76,16 @@ pub fn run_gui(gui_options: GuiOptions) -> Result<()> {
     eframe::run_native(
         "Orpheus",
         native_options,
-        Box::new(move |cc| Ok(Box::new(OrpheusGui::new(cc, gui_options)))),
+        Box::new(move |cc| {
+            Ok(Box::new(OrpheusGui::new(
+                cc,
+                gui_options,
+                settings_path,
+                settings,
+                settings_error,
+                open_request,
+            )))
+        }),
     )?;
     Ok(())
 }
@@ -96,7 +123,10 @@ fn set_windows_taskbar_icon(cc: &eframe::CreationContext<'_>) {
     };
     // Use the actual app HWND; the foreground window may belong to another app at launch.
     unsafe {
-        let icon = LoadIconW(GetModuleHandleW(std::ptr::null()), 1usize as *const u16);
+        let icon = LoadIconW(
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::without_provenance(1),
+        );
         if !icon.is_null() {
             SendMessageW(
                 handle.hwnd.get() as _,
@@ -190,14 +220,64 @@ struct OrpheusGui {
     rate_status: Option<String>,
     last_error: Option<String>,
     last_refresh: Option<Instant>,
+    page: GuiPage,
+    settings: GuiSettings,
+    settings_path: std::path::PathBuf,
+    settings_error: Option<String>,
+    settings_status: Option<String>,
+    startup_enabled: bool,
+    tray: Option<Tray>,
+    in_tray: bool,
+    restoring_window: bool,
+    quit_requested: bool,
+    open_request: Option<desktop::OpenRequest>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum GuiPage {
+    #[default]
+    Devices,
+    Settings,
 }
 
 impl OrpheusGui {
-    fn new(cc: &eframe::CreationContext<'_>, options: GuiOptions) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        options: GuiOptions,
+        settings_path: std::path::PathBuf,
+        settings: GuiSettings,
+        mut settings_error: Option<String>,
+        open_request: Option<desktop::OpenRequest>,
+    ) -> Self {
         #[cfg(windows)]
         set_windows_taskbar_icon(cc);
         install_geist_fonts(&cc.egui_ctx);
         install_geist_style(&cc.egui_ctx);
+        if let Some(request) = &open_request {
+            request.attach(cc.egui_ctx.clone());
+        }
+        #[cfg(windows)]
+        let tray = match app_icon().and_then(|icon| Tray::new(cc.egui_ctx.clone(), icon)) {
+            Ok(tray) => Some(tray),
+            Err(err) => {
+                settings_error = Some(format!("Notification area unavailable: {err:#}"));
+                None
+            }
+        };
+        #[cfg(not(windows))]
+        let tray = None;
+        let startup_enabled = match desktop::startup_enabled() {
+            Ok(enabled) => enabled,
+            Err(err) => {
+                settings_error = Some(format!("Startup settings unavailable: {err:#}"));
+                false
+            }
+        };
+        let in_tray = tray.is_some() && settings.start_minimized;
+        cc.egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::Minimized(in_tray));
+        cc.egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::Visible(!in_tray));
 
         Self {
             options,
@@ -210,7 +290,76 @@ impl OrpheusGui {
             rate_status: None,
             last_error: None,
             last_refresh: None,
+            page: GuiPage::Devices,
+            settings,
+            settings_path,
+            settings_error,
+            settings_status: None,
+            startup_enabled,
+            tray,
+            in_tray,
+            restoring_window: false,
+            quit_requested: false,
+            open_request,
         }
+    }
+
+    fn process_logic(&mut self, ctx: &egui::Context) {
+        self.drain_worker_events();
+        if self
+            .open_request
+            .as_ref()
+            .is_some_and(desktop::OpenRequest::take)
+        {
+            self.apply_tray_action(ctx, TrayAction::Open);
+        }
+        while let Some(action) = self.tray.as_ref().and_then(Tray::try_action) {
+            self.apply_tray_action(ctx, action);
+        }
+        self.update_window_state(ctx, self.tray.is_some());
+        ctx.request_repaint_after(REFRESH_INTERVAL);
+    }
+
+    fn update_window_state(&mut self, ctx: &egui::Context, tray_available: bool) {
+        if self.quit_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        let (close, minimized) = ctx.input(|input| {
+            (
+                input.viewport().close_requested(),
+                input.viewport().minimized.unwrap_or(false),
+            )
+        });
+        if !minimized {
+            self.restoring_window = false;
+        }
+        if tray_available {
+            if close && self.settings.close_to_tray {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.in_tray = true;
+            } else if minimized && self.settings.minimize_to_tray && !self.restoring_window {
+                self.in_tray = true;
+            }
+            if self.in_tray {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
+    }
+
+    fn apply_tray_action(&mut self, ctx: &egui::Context, action: TrayAction) {
+        if action == TrayAction::Quit {
+            self.quit_requested = true;
+            return;
+        }
+        if action == TrayAction::Settings {
+            self.page = GuiPage::Settings;
+        }
+        self.in_tray = false;
+        self.restoring_window = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
     fn drain_worker_events(&mut self) {
@@ -300,9 +449,8 @@ impl OrpheusGui {
     }
 }
 
-impl eframe::App for OrpheusGui {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_worker_events();
+impl OrpheusGui {
+    fn draw_ui(&mut self, ui: &mut egui::Ui) {
         let focused = ui.ctx().input(|input| input.focused);
         let repaint_interval = if self.options.steady_repaint && focused {
             Duration::from_millis(16)
@@ -333,28 +481,52 @@ impl eframe::App for OrpheusGui {
                 });
 
                 ui.add_space(22.0);
-                let body_height = (ui.available_height() - 44.0).max(0.0);
                 ui.horizontal(|ui| {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(286.0, body_height),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.set_width(286.0);
-                            ui.set_height(body_height);
-                            draw_device_sidebar(ui, self);
-                        },
-                    );
-                    ui.add_space(16.0);
+                    for (page, label) in [
+                        (GuiPage::Devices, "Devices"),
+                        (GuiPage::Settings, "Settings"),
+                    ] {
+                        let color = if self.page == page { BG } else { TEXT };
+                        ui.selectable_value(
+                            &mut self.page,
+                            page,
+                            RichText::new(label).color(color),
+                        );
+                    }
+                });
+                ui.add_space(12.0);
+                let body_height = (ui.available_height() - 44.0).max(0.0);
+                if self.page == GuiPage::Settings {
                     ui.allocate_ui_with_layout(
                         Vec2::new(ui.available_width(), body_height),
                         Layout::top_down(Align::Min),
                         |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.set_height(body_height);
-                            draw_device_detail(ui, self);
+                            draw_settings(ui, self);
                         },
                     );
-                });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(286.0, body_height),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_width(286.0);
+                                ui.set_height(body_height);
+                                draw_device_sidebar(ui, self);
+                            },
+                        );
+                        ui.add_space(16.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(ui.available_width(), body_height),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.set_height(body_height);
+                                draw_device_detail(ui, self);
+                            },
+                        );
+                    });
+                }
 
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     ui.add_space(4.0);
@@ -364,6 +536,90 @@ impl eframe::App for OrpheusGui {
                 });
             });
     }
+}
+
+impl eframe::App for OrpheusGui {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.process_logic(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw_ui(ui);
+    }
+}
+
+fn draw_settings(ui: &mut egui::Ui, app: &mut OrpheusGui) {
+    ScrollArea::vertical()
+        .id_salt("settings")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.heading(RichText::new("Settings").color(TEXT));
+            ui.add_space(18.0);
+            ui.label(RichText::new("Startup").strong().color(TEXT));
+            let previous_startup = app.startup_enabled;
+            if ui
+                .add_enabled(
+                    cfg!(windows),
+                    egui::Checkbox::new(
+                        &mut app.startup_enabled,
+                        RichText::new("Run on Windows startup").color(TEXT),
+                    ),
+                )
+                .changed()
+            {
+                match desktop::set_startup(app.startup_enabled) {
+                    Ok(()) => {
+                        app.settings_error = None;
+                        app.settings_status = Some("Startup setting saved".to_string());
+                    }
+                    Err(err) => {
+                        app.startup_enabled = previous_startup;
+                        app.settings_error = Some(format!("{err:#}"));
+                    }
+                }
+            }
+            let previous = app.settings.clone();
+            ui.add_enabled_ui(app.tray.is_some(), |ui| {
+                ui.checkbox(
+                    &mut app.settings.start_minimized,
+                    RichText::new("Start minimized to notification area").color(TEXT),
+                );
+                ui.add_space(18.0);
+                ui.label(RichText::new("Window behavior").strong().color(TEXT));
+                ui.checkbox(
+                    &mut app.settings.minimize_to_tray,
+                    RichText::new("Minimize to notification area").color(TEXT),
+                );
+                ui.checkbox(
+                    &mut app.settings.close_to_tray,
+                    RichText::new("Close to notification area").color(TEXT),
+                );
+            });
+            if previous != app.settings {
+                match app.settings.save(&app.settings_path) {
+                    Ok(()) => {
+                        app.settings_error = None;
+                        app.settings_status = Some("Settings saved".to_string());
+                    }
+                    Err(err) => {
+                        app.settings = previous;
+                        app.settings_error = Some(format!("{err:#}"));
+                    }
+                }
+            }
+            ui.add_space(24.0);
+            if ui.add(geist_button("Quit Orpheus")).clicked() {
+                app.quit_requested = true;
+                ui.ctx().request_repaint();
+            }
+            if let Some(error) = &app.settings_error {
+                ui.add_space(12.0);
+                error_line(ui, "Settings error", error);
+            } else if let Some(status) = &app.settings_status {
+                ui.add_space(12.0);
+                ui.label(RichText::new(status).color(MUTED));
+            }
+        });
 }
 
 fn status_bar(ui: &mut egui::Ui, app: &OrpheusGui) {
@@ -995,6 +1251,17 @@ mod tests {
             rate_status: None,
             last_error: None,
             last_refresh: None,
+            page: GuiPage::Devices,
+            settings: GuiSettings::default(),
+            settings_path: std::path::PathBuf::new(),
+            settings_error: None,
+            settings_status: None,
+            startup_enabled: false,
+            tray: None,
+            in_tray: false,
+            restoring_window: false,
+            quit_requested: false,
+            open_request: None,
         };
         app.reconcile_selection();
         app.reconcile_targets();
@@ -1170,6 +1437,99 @@ mod tests {
                     let max = ui.max_rect();
                     status_bar(ui, &app);
                     assert!(ui.min_rect().max.x <= max.max.x + 1.0);
+                },
+            );
+        }
+    }
+
+    fn lifecycle(
+        app: &mut OrpheusGui,
+        close: bool,
+        minimized: bool,
+        tray: bool,
+    ) -> Vec<egui::ViewportCommand> {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+        viewport.minimized = Some(minimized);
+        if close {
+            viewport.events.push(egui::ViewportEvent::Close);
+        }
+        let output = ctx.run_ui(input, |ui| app.update_window_state(ui.ctx(), tray));
+        output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .clone()
+    }
+
+    #[test]
+    fn close_and_minimize_hide_only_when_a_tray_is_available() {
+        for (close, minimized) in [(true, false), (false, true)] {
+            let (mut app, _) = app();
+            let commands = lifecycle(&mut app, close, minimized, true);
+            assert!(commands.contains(&egui::ViewportCommand::Visible(false)));
+            assert_eq!(
+                commands.contains(&egui::ViewportCommand::CancelClose),
+                close
+            );
+            let (mut app, _) = self::app();
+            assert!(
+                !lifecycle(&mut app, close, minimized, false)
+                    .contains(&egui::ViewportCommand::Visible(false))
+            );
+        }
+        let (mut app, _) = app();
+        app.settings.close_to_tray = false;
+        assert!(
+            !lifecycle(&mut app, true, false, true).contains(&egui::ViewportCommand::CancelClose)
+        );
+        app.settings.minimize_to_tray = false;
+        assert!(
+            !lifecycle(&mut app, false, true, true)
+                .contains(&egui::ViewportCommand::Visible(false))
+        );
+    }
+
+    #[test]
+    fn tray_restore_ignores_stale_minimized_input_and_quit_bypasses_close_to_tray() {
+        let (mut app, _) = app();
+        app.in_tray = true;
+        let ctx = egui::Context::default();
+        app.apply_tray_action(&ctx, TrayAction::Settings);
+        assert_eq!(app.page, GuiPage::Settings);
+        assert!(
+            !lifecycle(&mut app, false, true, true)
+                .contains(&egui::ViewportCommand::Visible(false))
+        );
+        assert!(!app.in_tray);
+        let _ = lifecycle(&mut app, false, false, true);
+        assert!(!app.restoring_window);
+        app.apply_tray_action(&ctx, TrayAction::Quit);
+        let commands = lifecycle(&mut app, true, false, true);
+        assert!(commands.contains(&egui::ViewportCommand::Close));
+        assert!(!commands.contains(&egui::ViewportCommand::CancelClose));
+    }
+
+    #[test]
+    fn both_pages_fit_the_minimum_window() {
+        let (mut app, _) = app();
+        let ctx = egui::Context::default();
+        install_geist_fonts(&ctx);
+        install_geist_style(&ctx);
+        for page in [GuiPage::Devices, GuiPage::Settings] {
+            app.page = page;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(760.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let max = ui.max_rect();
+                    app.draw_ui(ui);
+                    assert!(ui.min_rect().max.x <= max.max.x + 1.0);
+                    assert!(ui.min_rect().max.y <= max.max.y + 1.0);
                 },
             );
         }
