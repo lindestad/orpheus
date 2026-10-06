@@ -43,9 +43,12 @@ pub struct GuiOptions {
 }
 
 pub fn run_gui(gui_options: GuiOptions) -> Result<()> {
+    #[cfg(windows)]
+    set_windows_app_id()?;
     let native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("Orpheus")
+            .with_icon(app_icon()?)
             .with_inner_size([960.0, 640.0])
             .with_min_inner_size([760.0, 500.0]),
         wgpu_options: gui_wgpu_options(gui_options),
@@ -58,6 +61,51 @@ pub fn run_gui(gui_options: GuiOptions) -> Result<()> {
         Box::new(move |cc| Ok(Box::new(OrpheusGui::new(cc, gui_options)))),
     )?;
     Ok(())
+}
+
+fn app_icon() -> Result<egui::IconData> {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .context("failed to decode app icon")
+}
+
+#[cfg(windows)]
+fn set_windows_app_id() -> Result<()> {
+    let app_id: Vec<u16> = "Orpheus\0".encode_utf16().collect();
+    let result = unsafe {
+        windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(app_id.as_ptr())
+    };
+    anyhow::ensure!(
+        result >= 0,
+        "failed to set Windows app identity: {result:#x}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_windows_taskbar_icon(cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::{
+        System::LibraryLoader::GetModuleHandleW,
+        UI::WindowsAndMessaging::{ICON_BIG, LoadIconW, SendMessageW, WM_SETICON},
+    };
+    let Ok(handle) = cc.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    // Use the actual app HWND; the foreground window may belong to another app at launch.
+    unsafe {
+        let icon = LoadIconW(GetModuleHandleW(std::ptr::null()), 1usize as *const u16);
+        if !icon.is_null() {
+            SendMessageW(
+                handle.hwnd.get() as _,
+                WM_SETICON,
+                ICON_BIG as usize,
+                icon as isize,
+            );
+        }
+    }
 }
 
 fn gui_wgpu_options(options: GuiOptions) -> WgpuConfiguration {
@@ -146,6 +194,8 @@ struct OrpheusGui {
 
 impl OrpheusGui {
     fn new(cc: &eframe::CreationContext<'_>, options: GuiOptions) -> Self {
+        #[cfg(windows)]
+        set_windows_taskbar_icon(cc);
         install_geist_fonts(&cc.egui_ctx);
         install_geist_style(&cc.egui_ctx);
 

@@ -36,6 +36,7 @@ if ($running) {
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 Copy-Item -LiteralPath $sourceExe -Destination $installedExe -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination $installDir -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot 'assets\icon-LICENSE.txt') -Destination $installDir -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'assets\fonts\OFL.txt') -Destination (Join-Path $installDir 'Geist-OFL.txt') -Force
 
 $shell = New-Object -ComObject WScript.Shell
